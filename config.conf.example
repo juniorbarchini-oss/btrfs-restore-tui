@@ -1,0 +1,17 @@
+# Btrfs Restore TUI - Example Configuration File
+# Copy this file to ~/.config/btrfs-restore/config.conf or /etc/btrfs-restore/config.conf
+
+# Remote host IP or hostname (leave empty if only using Local / USB backups)
+BTRFS_REMOTE_HOST=192.168.1.100
+
+# Remote backup storage directory
+BTRFS_REMOTE_PATH=/mnt/backups
+
+# SSH user on the remote host (defaults to current user)
+BTRFS_REMOTE_USER=user
+
+# Human-readable display label for remote snapshots (e.g. "BackupServer", "NAS")
+BTRFS_REMOTE_NAME=BackupServer
+
+# SSH Port
+BTRFS_REMOTE_PORT=22

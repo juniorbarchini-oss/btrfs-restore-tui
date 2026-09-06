@@ -1,9 +1,8 @@
 __pycache__/
 *.py[cod]
 *$py.class
-.venv/
-env/
-build/
-dist/
-*.egg-info/
-.DS_Store
+.pytest_cache/
+*.swp
+*.bak
+config.conf
+.env
