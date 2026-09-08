@@ -121,7 +121,12 @@ def main() -> None:
         sys.exit(2)
 
     if args.quiet or args.dry_run:
-        engine = BtrfsBackupEngine(cfg, callback=lambda t, m: console.print(f"[{t}]{m}", style=t))
+        def quiet_cb(t, m):
+            if t == "progress":
+                console.print(f"  {m}", style="progress", end="\r", highlight=False)
+            else:
+                console.print(f"[{t}] {m}", style=t)
+        engine = BtrfsBackupEngine(cfg, callback=quiet_cb)
         result = engine.run(dry_run=args.dry_run)
     else:
         dash = Dashboard("Synchronizing snapshots")

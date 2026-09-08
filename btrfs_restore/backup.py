@@ -64,9 +64,13 @@ class BtrfsBackupEngine:
     def __init__(self, cfg: Config, ops: Optional[BtrfsOps] = None,
                  callback: Optional[EventCallback] = None):
         self.cfg = cfg
-        self.ops = ops or BtrfsOps()
         self._external_cb = callback or (lambda t, m: None)
         self._logfile = None
+        self._send_label = ""
+        self.ops = ops or BtrfsOps(progress_cb=self._on_send_progress)
+
+    def _on_send_progress(self, text: str) -> None:
+        self._emit("progress", f"{self._send_label}{text}")
 
     # -- logging ------------------------------------------------------
 
@@ -238,6 +242,7 @@ class BtrfsBackupEngine:
 
     def _send(self, kind: str, local: Path, parent: Optional[Path],
               snap_dir: Path, target_is_btrfs: Optional[bool]) -> None:
+        self._send_label = f"{kind} "
         if target_is_btrfs:
             rc = self.ops.send_local_receive(local, parent, snap_dir)
         else:
