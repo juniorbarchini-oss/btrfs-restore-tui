@@ -38,6 +38,11 @@ DEFAULT_MAX_DISK_PERCENT = 80
 DEFAULT_MIN_KEEP = 2
 DEFAULT_MAX_SNAPSHOTS = 0
 
+# How many local RO snapshots to keep per kind (root/home). They only serve as
+# `btrfs send -p` parents for the next run; kept generous so a co-existing
+# backup script's incremental chain is never broken.
+DEFAULT_LOCAL_KEEP = 10
+
 # Subvolumes captured by `backup-now`. Mount points, not subvol names.
 DEFAULT_SOURCE_MOUNTS = ["/", "/home"]
 
@@ -153,6 +158,7 @@ class Config:
     max_disk_percent: int = DEFAULT_MAX_DISK_PERCENT
     min_keep: int = DEFAULT_MIN_KEEP
     max_snapshots: int = DEFAULT_MAX_SNAPSHOTS
+    local_keep: int = DEFAULT_LOCAL_KEEP
 
     # -- remote (SSH) target ----------------------------------------
     remote_host: str = ""
@@ -220,6 +226,10 @@ class Config:
         mk = _int(_env("MIN_KEEP"), fv.get("MIN_KEEP"), lo=1)
         if mk is not None:
             cfg.min_keep = mk
+
+        lk = _int(_env("LOCAL_KEEP"), fv.get("LOCAL_KEEP"), lo=1)
+        if lk is not None:
+            cfg.local_keep = lk
 
         cap = _int(_env("KEEP"), _env("MAX_SNAPSHOTS"),
                    fv.get("MAX_SNAPSHOTS"), fv.get("KEEP_SNAPSHOTS"))
@@ -312,7 +322,8 @@ def _dump() -> None:
         ("target is btrfs", {True: "yes", False: "no (streams .btrfs.zst)", None: "unknown"}[btrfs]),
         ("snapshots dir", str(cfg.snapshots_dir) if cfg.snapshots_dir else "-"),
         ("latest link", str(cfg.latest_link) if cfg.latest_link else "-"),
-        ("retention", f"max_disk={cfg.max_disk_percent}%  min_keep={cfg.min_keep}  max_snapshots={cfg.max_snapshots or 'off'}"),
+        ("retention", f"max_disk={cfg.max_disk_percent}%  min_keep={cfg.min_keep}  "
+                      f"max_snapshots={cfg.max_snapshots or 'off'}  local_keep={cfg.local_keep}"),
         ("remote", f"{cfg.remote_name}  {cfg.remote_user}@{cfg.remote_host or '(none)'}:{cfg.remote_path or ''}  port {cfg.remote_port}"),
     ]
     width = max(len(k) for k, _ in rows)

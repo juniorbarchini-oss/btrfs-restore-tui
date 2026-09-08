@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Resolve real location (follow symlinks), run from the system venv if installed,
+# else from the source tree. main.py self-elevates with sudo when needed.
+SOURCE_FILE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE_FILE" ]; do
+    DIR="$(cd -P "$(dirname "$SOURCE_FILE")" && pwd)"
+    SOURCE_FILE="$(readlink "$SOURCE_FILE")"
+    [[ $SOURCE_FILE != /* ]] && SOURCE_FILE="$DIR/$SOURCE_FILE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE_FILE")/.." && pwd)"
+
+if [ -d "/opt/btrfs-restore-tui/.venv" ]; then
+    PY="/opt/btrfs-restore-tui/.venv/bin/python3"; APP="/opt/btrfs-restore-tui"
+elif [ -d "${SCRIPT_DIR}/.venv" ]; then
+    PY="${SCRIPT_DIR}/.venv/bin/python3"; APP="${SCRIPT_DIR}"
+else
+    PY="python3"; APP="${SCRIPT_DIR}"
+fi
+exec "$PY" "${APP}/main.py" "$@"
