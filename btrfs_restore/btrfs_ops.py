@@ -169,10 +169,13 @@ class BtrfsOps:
         except (BrokenPipeError, OSError):
             pass
         finally:
-            try:
-                p_sink.stdin.close()
-            except OSError:
-                pass
+            for fh in (p_sink.stdin, p_send.stdout, p_send.stderr,
+                       p_sink.stdout, p_sink.stderr):
+                try:
+                    if fh:
+                        fh.close()
+                except OSError:
+                    pass
         p_send.wait()
         p_sink.wait()
         if total:

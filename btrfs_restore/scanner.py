@@ -1,6 +1,8 @@
 """
 Snapshot scanner and detector for local, USB, and remote Btrfs subvolumes and archives.
 """
+import json
+import logging
 import os
 import re
 import getpass
@@ -12,6 +14,10 @@ import xml.etree.ElementTree as ET
 
 from .config import Config
 from .models import SnapshotInfo, SnapshotType
+
+logger = logging.getLogger("btrfs_restore")
+
+_TS_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}(?:_\d)?$")
 
 
 class SnapshotScanner:
@@ -128,12 +134,90 @@ class SnapshotScanner:
                                 is_subvolume=True,
                             )
                         )
-                    except Exception:
-                        pass
+                    except (ET.ParseError, OSError, ValueError) as exc:
+                        logger.warning("skipping snapper snapshot %s: %s", entry.name, exc)
 
         # Sort local snapshots descending by time (newest first)
         snapshots.sort(key=lambda s: s.timestamp, reverse=True)
         return snapshots
+
+    def scan_target_snapshots(self) -> List[SnapshotInfo]:
+        """Read the manifest-based layout written by `backup-now`:
+
+            <target>/btrfs-restore/snapshots/<YYYY-MM-DD_HHMMSS>/
+                manifest.json
+                root_<ts>/ | root.btrfs.zst
+                home_<ts>/ | home.btrfs.zst
+
+        One SnapshotInfo per kind (root/home). Timestamp and status come from
+        the manifest, not from parsing names.
+        """
+        out: List[SnapshotInfo] = []
+        base = self.config.snapshots_dir
+        if not base or not base.is_dir():
+            return out
+
+        try:
+            entries = sorted(base.iterdir(), key=lambda p: p.name, reverse=True)
+        except OSError as exc:
+            logger.warning("cannot list %s: %s", base, exc)
+            return out
+
+        for snap in entries:
+            if not snap.is_dir() or snap.is_symlink() or not _TS_DIR_RE.match(snap.name):
+                continue
+            try:
+                manifest = json.loads((snap / "manifest.json").read_text())
+            except (OSError, ValueError) as exc:
+                logger.warning("snapshot %s has no readable manifest: %s", snap.name, exc)
+                manifest = {}
+
+            status = manifest.get("status", "unknown")
+            if status in ("running", "failed"):
+                logger.info("skipping %s snapshot %s", status, snap.name)
+                continue
+
+            created = manifest.get("created_at") or manifest.get("started_at")
+            try:
+                ts = datetime.fromisoformat(created) if created else \
+                    datetime.fromtimestamp(snap.stat().st_mtime)
+            except (ValueError, OSError):
+                ts = datetime.fromtimestamp(snap.stat().st_mtime)
+
+            for kind in ("root", "home"):
+                sub = next(iter(sorted(snap.glob(f"{kind}_*"))), None)
+                stream = snap / f"{kind}.btrfs.zst"
+                if sub and sub.is_dir():
+                    path, is_subvol = sub, True
+                elif stream.is_file():
+                    path, is_subvol = stream, False
+                else:
+                    continue
+
+                target_path = path
+                if kind == "home" and is_subvol:
+                    user_home = path / self.user
+                    if user_home.exists():
+                        target_path = user_home
+
+                label = "Root /" if kind == "root" else "Home"
+                tag = "" if status == "completed" else f" ({status})"
+                size = manifest.get("size_bytes")
+                out.append(SnapshotInfo(
+                    id=f"target_{snap.name}_{kind}",
+                    name=f"USB: {label} [{ts.strftime('%d-%b %H:%M')}]{tag}",
+                    path=target_path,
+                    snap_type=SnapshotType.USB,
+                    timestamp=ts,
+                    description=f"backup-now snapshot {snap.name} ({kind})",
+                    is_subvolume=is_subvol,
+                    size_bytes=size,
+                    status=status,
+                    manifest=manifest,
+                ))
+
+        out.sort(key=lambda s: s.timestamp, reverse=True)
+        return out
 
     def scan_usb_snapshots(self) -> List[SnapshotInfo]:
         """Scans mounted USB storage for native Btrfs subvolumes and legacy archives."""
@@ -331,19 +415,25 @@ class SnapshotScanner:
                                 size_bytes=size,
                             )
                         )
-                    except Exception:
+                    except (ValueError, IndexError) as exc:
+                        logger.warning("skipping remote entry %r: %s", line, exc)
                         continue
 
         snapshots.sort(key=lambda s: s.timestamp, reverse=True)
         return snapshots
 
-    # Alias for backwards compatibility
-    scan_i7server_snapshots = scan_remote_snapshots
-
     def scan_all(self) -> List[SnapshotInfo]:
-        """Returns all available snapshots (Local + USB + Remote)."""
-        all_snaps = []
+        """Every available snapshot: manifest-based target + legacy local/USB + remote."""
+        all_snaps: List[SnapshotInfo] = []
+        all_snaps.extend(self.scan_target_snapshots())
         all_snaps.extend(self.scan_local_snapshots())
         all_snaps.extend(self.scan_usb_snapshots())
         all_snaps.extend(self.scan_remote_snapshots())
-        return all_snaps
+        # de-dupe by id, keep first (target layout wins over legacy USB scan)
+        seen, deduped = set(), []
+        for s in all_snaps:
+            if s.id in seen:
+                continue
+            seen.add(s.id)
+            deduped.append(s)
+        return deduped
