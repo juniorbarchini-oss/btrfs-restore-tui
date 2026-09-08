@@ -225,10 +225,10 @@ class SnapshotScanner:
         """Scans remote native Btrfs subvolumes and archives on configured remote server via SSH."""
         snapshots: List[SnapshotInfo] = []
         ip = self.config.remote_host
-        if not ip:
+        remote_dest = self.config.remote_path
+        if not ip or not remote_dest:
             return snapshots
 
-        remote_dest = self.config.remote_path
         remote_user = self.config.remote_user or self.user
         remote_name = self.config.remote_name or "Remote"
         remote_port = self.config.remote_port
