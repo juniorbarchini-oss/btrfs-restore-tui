@@ -331,8 +331,18 @@ class BtrfsRestoreApp(App):
         self.refresh_snapshots()
 
     def refresh_snapshots(self) -> None:
-        # Load local and USB snapshots immediately (sub-millisecond latency)
-        self.snapshots = self.scanner.scan_local_snapshots() + self.scanner.scan_usb_snapshots()
+        # Manifest-based backup-now snapshots first, then legacy local/USB scans.
+        self.snapshots = (
+            self.scanner.scan_target_snapshots()
+            + self.scanner.scan_local_snapshots()
+            + self.scanner.scan_usb_snapshots()
+        )
+        seen, deduped = set(), []
+        for s in self.snapshots:
+            if s.id not in seen:
+                seen.add(s.id)
+                deduped.append(s)
+        self.snapshots = deduped
         if self.snapshots:
             self.current_snapshot = next(
                 (s for s in self.snapshots if "home" in s.id.lower()),

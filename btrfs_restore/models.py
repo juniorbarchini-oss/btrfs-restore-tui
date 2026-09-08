@@ -31,10 +31,16 @@ class SnapshotInfo:
     description: str = ""
     is_subvolume: bool = True
     size_bytes: Optional[int] = None
+    status: str = "completed"          # completed | partial | unknown
+    manifest: Optional[dict] = None    # the backup manifest.json, when present
 
     @property
     def formatted_time(self) -> str:
         return self.timestamp.strftime("%Y-%m-%d %H:%M:%S")
+
+    @property
+    def usable(self) -> bool:
+        return self.status in ("completed", "partial", "unknown")
 
 
 @dataclass
