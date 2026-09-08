@@ -34,6 +34,7 @@ from typing import Callable, Dict, List, Optional
 
 from .config import Config
 from .btrfs_ops import BtrfsOps, CommandError
+from .system_state import SystemStateCollector
 
 logger = logging.getLogger("btrfs_restore")
 
@@ -62,11 +63,13 @@ class BackupResult:
 
 class BtrfsBackupEngine:
     def __init__(self, cfg: Config, ops: Optional[BtrfsOps] = None,
-                 callback: Optional[EventCallback] = None):
+                 callback: Optional[EventCallback] = None,
+                 state_collector_cls=None):
         self.cfg = cfg
         self._external_cb = callback or (lambda t, m: None)
         self._logfile = None
         self._send_label = ""
+        self._state_collector_cls = state_collector_cls or SystemStateCollector
         self.ops = ops or BtrfsOps(progress_cb=self._on_send_progress)
 
     def _on_send_progress(self, text: str) -> None:
@@ -180,12 +183,11 @@ class BtrfsBackupEngine:
                            f"Send {kind} ({'incremental' if parent else 'full'})")
                 self._send(kind, local, parent, snap_dir, target_is_btrfs)
 
-            self._emit("stage", "System state")
-            state_warn = self._collect_system_state(snap_dir / "_system_state")
+            self._emit("stage", "System state (packages, config, restore.sh)")
+            state_warn = self._state_collector_cls(snap_dir).collect_all()
             result.warnings.extend(state_warn)
             for w in state_warn:
                 self._emit("warning", w)
-            self._write_restore_script(snap_dir, target_is_btrfs)
 
             duration = round(time.time() - start, 2)
             result.status = "completed"
@@ -249,54 +251,6 @@ class BtrfsBackupEngine:
             rc = self.ops.send_to_stream(local, parent, snap_dir / f"{kind}.btrfs.zst")
         if rc != 0:
             raise CommandError(rc, f"btrfs send {kind}")
-
-    def _collect_system_state(self, meta_dir: Path) -> List[str]:
-        """Minimal for #1 - #2 replaces this with the full Arch collector."""
-        warnings: List[str] = []
-        meta_dir.mkdir(parents=True, exist_ok=True)
-        info = {
-            "hostname": os.uname().nodename,
-            "kernel": os.uname().release,
-            "arch": os.uname().machine,
-            "captured_at": datetime.now().isoformat(),
-        }
-        osr = Path("/etc/os-release")
-        if osr.is_file():
-            for line in osr.read_text().splitlines():
-                if line.startswith("PRETTY_NAME="):
-                    info["distro"] = line.split("=", 1)[1].strip().strip('"')
-        try:
-            (meta_dir / "os_info.json").write_text(json.dumps(info, indent=2))
-        except OSError as exc:
-            warnings.append(f"os_info: {exc}")
-        if shutil.which("pacman"):
-            for args, fname in (
-                (["pacman", "-Qqe"], "pkglist_explicit.txt"),
-                (["pacman", "-Qqm"], "pkglist_aur.txt"),
-            ):
-                try:
-                    import subprocess
-                    res = subprocess.run(args, capture_output=True, text=True, timeout=60)
-                    if res.returncode == 0:
-                        (meta_dir / fname).write_text(res.stdout)
-                except (OSError, subprocess.SubprocessError) as exc:
-                    warnings.append(f"{fname}: {exc}")
-        else:
-            warnings.append("pacman not found; package lists not saved (#2)")
-        return warnings
-
-    def _write_restore_script(self, snap_dir: Path, target_is_btrfs: Optional[bool]) -> None:
-        """Placeholder recovery script - #2 generates the real bare-metal one."""
-        script = snap_dir / "restore.sh"
-        try:
-            script.write_text(
-                "#!/usr/bin/env bash\n"
-                "# Placeholder - full bare-metal restore.sh is generated in issue #2.\n"
-                "echo 'Use restore-now (the TUI) to restore individual files from this snapshot.'\n"
-            )
-            script.chmod(0o755)
-        except OSError as exc:
-            self._emit("warning", f"restore.sh: {exc}")
 
     # -- helpers -----------------------------------------------------
 

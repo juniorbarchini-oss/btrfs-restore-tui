@@ -64,6 +64,19 @@ class FakeBtrfsOps:
         return self.disk_percent
 
 
+class StubStateCollector:
+    """No-op stand-in for SystemStateCollector - no shelling out to pacman."""
+    def __init__(self, snapshot_dir):
+        self.d = snapshot_dir
+
+    def collect_all(self):
+        meta = self.d / "_system_state"
+        meta.mkdir(parents=True, exist_ok=True)
+        (meta / "os_info.json").write_text('{"user": "tester"}')
+        (self.d / "restore.sh").write_text("#!/usr/bin/env bash\ntrue\n")
+        return []
+
+
 class BackupTestBase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -81,6 +94,7 @@ class BackupTestBase(unittest.TestCase):
             mock.patch.object(cfgmod, "_home_of", return_value=root),
             mock.patch.object(cfgmod, "_autodetect_backup_target", return_value=None),
             mock.patch("btrfs_restore.backup.os.geteuid", return_value=0),
+            mock.patch("btrfs_restore.backup.SystemStateCollector", StubStateCollector),
             mock.patch.dict(os.environ, {}, clear=True),
         ]
         for p in self._patchers:

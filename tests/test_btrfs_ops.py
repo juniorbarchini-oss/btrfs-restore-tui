@@ -29,18 +29,16 @@ class TestCountedPipe(unittest.TestCase):
         ops = BtrfsOps(progress_cb=seen.append)
         # force the built-in counter path regardless of whether pv is installed
         ops._use_pv, ops._count = False, True
-        out = Path("/dev/null").open("wb")
-        try:
+        with open("/dev/null", "wb") as out:
             rc = ops._run_counted(["head", "-c", "3000000", "/dev/zero"], ["cat"], out)
-        finally:
-            out.close()
         self.assertEqual(rc, 0)
         self.assertTrue(seen and "sent" in seen[-1])
 
     def test_pipe_failure_propagates(self):
         ops = BtrfsOps(progress_cb=lambda s: None)
         ops._use_pv, ops._count = False, True
-        rc = ops._run_counted(["false"], ["cat"], Path("/dev/null").open("wb"))
+        with open("/dev/null", "wb") as out:
+            rc = ops._run_counted(["false"], ["cat"], out)
         self.assertNotEqual(rc, 0)
 
 
