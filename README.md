@@ -95,15 +95,15 @@ Alternatively, environment variables can be set (`BTRFS_REMOTE_HOST`, `BTRFS_REM
 ### Requirements
 * Arch Linux / Omarchy Quattro:
   ```bash
-  sudo pacman -S python-textual btrfs-progs zstd openssh
+  sudo pacman -S python-textual btrfs-progs zstd pv openssh
   ```
 * Debian / Ubuntu (Btrfs root):
   ```bash
-  sudo apt install python3-textual btrfs-progs zstd openssh-client
+  sudo apt install python3-textual btrfs-progs zstd pv openssh-client
   ```
 * Fedora:
   ```bash
-  sudo dnf install python3-textual btrfs-progs zstd openssh-clients
+  sudo dnf install python3-textual btrfs-progs zstd pv openssh-clients
   ```
 
 ### Installation

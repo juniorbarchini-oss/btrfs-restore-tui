@@ -31,6 +31,10 @@ MAX_DISK_PERCENT=80
 MIN_KEEP=2
 # Optional extra hard cap on the snapshot count (0 = disabled).
 #MAX_SNAPSHOTS=0
+# How many local RO snapshots to keep per kind (root/home). They only serve as
+# `btrfs send -p` parents for the next run. Kept generous so a co-existing
+# backup script's incremental chain is never broken.
+#LOCAL_KEEP=10
 
 # --- Remote SSH target ------------------------------------------------
 # Native btrfs replication over SSH. The remote user needs to be able to run
