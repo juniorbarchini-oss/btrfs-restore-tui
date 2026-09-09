@@ -1,3 +1,4 @@
+import logging
 import os
 import shutil
 import signal
@@ -9,10 +10,16 @@ from typing import Callable, Generator, List, Optional
 from .config import Config
 from .models import ConflictResolution, RestoreItem, RestoreProgress, SnapshotInfo, SnapshotType
 
+logger = logging.getLogger("btrfs_restore")
+
+_DEFAULT_STAGING = Path("/.snapshots/staging")
+
 
 class RestoreEngine:
     def __init__(self):
-        self._active_proc: Optional[subprocess.Popen] = None
+        self._active_procs: List[subprocess.Popen] = []
+        self._config = Config.load()
+        self.staging_dir = self._config.staging_dir or _DEFAULT_STAGING
         # Determine real user UID and GID (when running under sudo)
         sudo_uid = os.getenv("SUDO_UID")
         sudo_gid = os.getenv("SUDO_GID")
@@ -26,16 +33,59 @@ class RestoreEngine:
 
     def cancel_active_operation(self) -> None:
         """Cancel any running streaming process and purge staging subvolumes."""
-        if self._active_proc and self._active_proc.poll() is None:
-            try:
-                os.killpg(os.getpgid(self._active_proc.pid), signal.SIGTERM)
-            except Exception:
+        for proc in self._active_procs:
+            if proc.poll() is None:
                 try:
-                    self._active_proc.terminate()
-                except Exception:
-                    pass
-        self._active_proc = None
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except (ProcessLookupError, PermissionError, OSError):
+                    try:
+                        proc.terminate()
+                    except OSError:
+                        pass
+        self._active_procs = []
         self.cleanup_staging()
+
+    def _run_pipeline(self, stages: List[List[str]]) -> None:
+        """Run `stages[0] | stages[1] | ...` with argv lists (never a shell).
+        Each process gets its own session so cancel can killpg the whole tree
+        (including a remote ssh). Raises RuntimeError with stderr on failure."""
+        procs: List[subprocess.Popen] = []
+        prev_stdout = None
+        try:
+            for i, stage in enumerate(stages):
+                p = subprocess.Popen(
+                    stage,
+                    stdin=prev_stdout,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                )
+                procs.append(p)
+                if prev_stdout is not None:
+                    prev_stdout.close()
+                prev_stdout = p.stdout
+        except FileNotFoundError as exc:
+            for p in procs:
+                p.kill()
+            raise RuntimeError(f"missing command: {exc}") from exc
+
+        self._active_procs = procs
+        errs = []
+        for p in procs:
+            _, err = p.communicate()
+            if err:
+                errs.append(err.decode("utf-8", "replace").strip())
+        self._active_procs = []
+
+        failed = next((p for p in procs if p.returncode not in (0, None)), None)
+        if failed is not None:
+            msg = " | ".join(e for e in errs if e) or "stream failed"
+            low = msg.lower()
+            if "parent" in low or "cannot find" in low or "no such file" in low:
+                raise RuntimeError(
+                    "Cannot receive incremental delta: parent subvolume missing "
+                    "on local disk. This backup requires its base parent.")
+            raise RuntimeError(msg)
 
     def _ensure_ownership(self, path: Path):
         """Ensure file or folder is owned by the real user instead of root."""
@@ -210,101 +260,73 @@ class RestoreEngine:
         )
 
     def cleanup_staging(self) -> None:
-        """Delete temporary subvolumes in /.snapshots/staging."""
-        staging_dir = Path("/.snapshots/staging")
-        if not staging_dir.exists():
+        """Delete temporary subvolumes in the staging dir."""
+        if not self.staging_dir.exists():
             return
-        for item in staging_dir.iterdir():
+        for item in self.staging_dir.iterdir():
             if item.is_dir():
-                cmd = ["btrfs", "subvolume", "delete", str(item)]
                 try:
-                    subprocess.run(cmd, capture_output=True, timeout=10)
-                except Exception:
-                    pass
+                    subprocess.run(["btrfs", "subvolume", "delete", str(item)],
+                                   capture_output=True, timeout=15)
+                except (OSError, subprocess.SubprocessError) as exc:
+                    logger.warning("could not delete staging subvolume %s: %s", item, exc)
+
+    def _ssh_argv(self, config: Config, user: str) -> List[str]:
+        """SSH options as a list - no shell string interpolation."""
+        argv = ["ssh", "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "ConnectTimeout=10", "-o", "BatchMode=yes"]
+        if config.remote_port and config.remote_port != 22:
+            argv += ["-p", str(config.remote_port)]
+        key = Path(f"/home/{user}/.ssh/id_ed25519")
+        if key.exists():
+            argv += ["-i", str(key)]
+        kh = Path(f"/home/{user}/.ssh/known_hosts")
+        if kh.exists():
+            argv += ["-o", f"UserKnownHostsFile={kh}"]
+        return argv
+
+    def _staging_stages(self, snapshot: SnapshotInfo, config: Config,
+                        user: str) -> Optional[List[List[str]]]:
+        """Argv-list pipeline to stage `snapshot`, or None if it needs no staging
+        (a mounted subvolume). Paths and config values are always single argv
+        elements - never spliced into a shell string."""
+        receive = ["btrfs", "receive", str(self.staging_dir)]
+        if snapshot.snap_type == SnapshotType.REMOTE:
+            if not config.remote_host:
+                raise RuntimeError("Remote host is not configured "
+                                   "(REMOTE_HOST in ~/.config/restore-tui/config.conf)")
+            ssh = self._ssh_argv(config, user)
+            remote = f"{config.remote_user or user}@{config.remote_host}"
+            src = str(snapshot.path)
+            if snapshot.is_subvolume:
+                return [[*ssh, remote, "sudo", "btrfs", "send", src], receive]
+            return [[*ssh, remote, "cat", src], ["zstd", "-dc"], receive]
+        if snapshot.snap_type == SnapshotType.USB:
+            return [["zstd", "-dc", str(snapshot.path)], receive]
+        return None
 
     def deploy_staging(self, snapshot: SnapshotInfo) -> Path:
-        """Deploy a remote or USB snapshot into /.snapshots/staging."""
-        staging_dir = Path("/.snapshots/staging")
-        staging_dir.mkdir(parents=True, exist_ok=True)
-        os.chmod(staging_dir, 0o755)
+        """Stream a remote or USB-stream snapshot into the staging dir and return
+        the browsable path. A snapshot that is already a mounted subvolume needs
+        no staging and is returned directly."""
+        if snapshot.is_subvolume and snapshot.snap_type == SnapshotType.USB:
+            return snapshot.path
+
+        self.staging_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.staging_dir, 0o755)
         self.cleanup_staging()
 
         config = Config.load()
         user = os.getenv("SUDO_USER") or os.getenv("USER") or getpass.getuser()
-        remote_user = config.remote_user or user
-        ip = config.remote_host
+        stages = self._staging_stages(snapshot, config, user)
+        if stages is None:  # LOCAL - always a mounted subvolume
+            return snapshot.path
 
-        if snapshot.snap_type == SnapshotType.REMOTE:
-            if not ip:
-                raise RuntimeError("Remote host is not configured in ~/.config/btrfs-restore/config.conf")
+        self._run_pipeline(stages)
 
-            ssh_key = Path(f"/home/{user}/.ssh/id_ed25519")
-            known_hosts = Path(f"/home/{user}/.ssh/known_hosts")
-
-            ssh_opts = ""
-            if config.remote_port != 22:
-                ssh_opts += f" -p {config.remote_port}"
-            if ssh_key.exists():
-                ssh_opts += f" -i {ssh_key}"
-            if known_hosts.exists():
-                ssh_opts += f" -o UserKnownHostsFile={known_hosts}"
-
-            if snapshot.is_subvolume:
-                # Native remote Btrfs subvolume on remote server
-                remote_cmd = (
-                    f"ssh -o StrictHostKeyChecking=no{ssh_opts} {remote_user}@{ip} "
-                    f"'sudo btrfs send \"{snapshot.path}\"' | btrfs receive '{staging_dir}'"
-                )
-            else:
-                # Legacy .btrfs.zst stream
-                remote_cmd = (
-                    f"ssh -o StrictHostKeyChecking=no{ssh_opts} {remote_user}@{ip} 'cat \"{snapshot.path}\"' "
-                    f"| zstd -dc | btrfs receive '{staging_dir}'"
-                )
-
-            self._active_proc = subprocess.Popen(
-                remote_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True
-            )
-            stdout, stderr = self._active_proc.communicate()
-            ret = self._active_proc.returncode
-            self._active_proc = None
-
-            if ret != 0:
-                err_msg = (stderr or "").strip()
-                if "parent" in err_msg.lower() or "cannot find" in err_msg.lower() or "no such file" in err_msg.lower():
-                    raise RuntimeError(
-                        "Cannot receive incremental delta: parent subvolume missing on local disk.\n"
-                        "This remote backup requires its base parent."
-                    )
-                raise RuntimeError(err_msg or "Failed to receive remote stream.")
-
-        elif snapshot.snap_type == SnapshotType.USB:
-            if snapshot.is_subvolume:
-                # If it's already a native subvolume mounted on USB, return directly
-                return snapshot.path
-
-            usb_cmd = f"cat '{snapshot.path}' | zstd -dc | btrfs receive '{staging_dir}'"
-            self._active_proc = subprocess.Popen(
-                usb_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True
-            )
-            stdout, stderr = self._active_proc.communicate()
-            ret = self._active_proc.returncode
-            self._active_proc = None
-
-            if ret != 0:
-                err_msg = (stderr or "").strip()
-                if "parent" in err_msg.lower() or "cannot find" in err_msg.lower() or "no such file" in err_msg.lower():
-                    raise RuntimeError(
-                        "Cannot receive incremental delta: parent subvolume missing on local disk."
-                    )
-                raise RuntimeError(err_msg or "Failed to receive USB stream.")
-
-        # Find staged subvolume
-        for item in staging_dir.iterdir():
+        for item in self.staging_dir.iterdir():
             if item.is_dir():
                 user_home = item / user
-                if user_home.exists():
-                    return user_home
-                return item
+                return user_home if user_home.exists() else item
 
-        raise RuntimeError("No received subvolume found in /.snapshots/staging")
+        raise RuntimeError(f"No received subvolume found in {self.staging_dir}")
