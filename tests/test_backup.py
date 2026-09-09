@@ -26,6 +26,9 @@ class FakeBtrfsOps:
         self.fail_send_on = fail_send_on or set()   # kinds whose send should fail
         self.subvolumes = set()
         self.sent = []
+        self.ssh_sent = []                          # (kind, parent_name) to remote
+        self.remote_subvols = {"root": [], "home": []}
+        self.ssh_calls = []
 
     def snapshot_ro(self, source: Path, dest: Path) -> None:
         dest.mkdir(parents=True, exist_ok=True)
@@ -62,6 +65,32 @@ class FakeBtrfsOps:
 
     def disk_usage_percent(self, path: Path) -> float:
         return self.disk_percent
+
+    # -- remote --------------------------------------------------
+    def ssh_capture(self, ssh_argv, remote, cmd_argv, timeout=25):
+        self.ssh_calls.append(list(cmd_argv))
+        out = ""
+        if cmd_argv[:4] == ["sudo", "btrfs", "subvolume", "list"]:
+            kind = cmd_argv[-1].rstrip("/").split("/")[-1]
+            out = "".join(f"ID 1 gen 1 top level 5 path {kind}/{n}\n"
+                          for n in self.remote_subvols.get(kind, []))
+        return _CP(0, out, "")
+
+    def send_ssh_receive(self, source, parent, ssh_argv, remote, receive_argv):
+        kind = source.name.split("_", 1)[0]
+        self.ssh_sent.append((kind, parent.name if parent else None))
+        if kind in self.fail_send_on:
+            return 1
+        self.remote_subvols.setdefault(kind, []).append(source.name)
+        return 0
+
+    def push_tree(self, local_dir, ssh_argv, remote, remote_dir):
+        return 0, ""
+
+
+class _CP:
+    def __init__(self, returncode, stdout, stderr):
+        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
 
 
 class StubStateCollector:
@@ -239,6 +268,52 @@ class TestBackupRetention(BackupTestBase):
                 BtrfsBackupEngine(cfg, ops=FakeBtrfsOps(target_is_btrfs=True)).run()
         left = [s for s in cfg.snapshots_dir.iterdir() if s.is_dir()]
         self.assertEqual(len(left), 2)
+
+
+class TestBackupRemote(BackupTestBase):
+    def _remote_cfg(self, with_usb=False):
+        cfg = self.make_cfg()
+        if not with_usb:
+            cfg.target_root = None
+        cfg.remote_host = "10.0.0.9"
+        cfg.remote_path = "/srv/backups"
+        cfg.remote_user = "bob"
+        return cfg
+
+    def test_remote_only_backup_works_without_usb(self):
+        cfg = self._remote_cfg()
+        ops = FakeBtrfsOps(target_is_btrfs=True)
+        r = BtrfsBackupEngine(cfg, ops=ops).run()
+        self.assertEqual(r.status, "completed", r.message)
+        # first run: full sends of root + home to the remote
+        self.assertEqual(sorted(k for k, _ in ops.ssh_sent), ["homefs", "rootfs"])
+        self.assertTrue(all(p is None for _, p in ops.ssh_sent))
+
+    def test_remote_incremental_uses_local_parent(self):
+        cfg = self._remote_cfg()
+        # pretend a previous run left rootfs_OLD/homefs_OLD both locally and remote
+        for kind in ("rootfs", "homefs"):
+            (self.local_snaps / f"{kind}_20260101_000000").mkdir()
+        ops = FakeBtrfsOps(target_is_btrfs=True)
+        ops.remote_subvols = {"rootfs": ["rootfs_20260101_000000"],
+                              "homefs": ["homefs_20260101_000000"]}
+        r = BtrfsBackupEngine(cfg, ops=ops).run()
+        self.assertEqual(r.status, "completed", r.message)
+        self.assertTrue(all(p == f"{k}_20260101_000000" for k, p in ops.ssh_sent))
+
+    def test_remote_send_failure_is_partial(self):
+        cfg = self._remote_cfg()
+        ops = FakeBtrfsOps(target_is_btrfs=True, fail_send_on={"homefs"})
+        r = BtrfsBackupEngine(cfg, ops=ops).run()
+        self.assertEqual(r.status, "partial", r.message)
+
+    def test_no_target_at_all_fails(self):
+        cfg = self.make_cfg()
+        cfg.target_root = None
+        cfg.remote_host = ""
+        r = BtrfsBackupEngine(cfg, ops=FakeBtrfsOps()).run()
+        self.assertEqual(r.status, "failed")
+        self.assertIn("target", r.message.lower())
 
 
 class TestBackupDryRun(BackupTestBase):

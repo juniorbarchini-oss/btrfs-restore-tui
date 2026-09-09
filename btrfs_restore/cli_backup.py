@@ -63,21 +63,26 @@ class Dashboard:
 
 
 def _header(cfg: Config, dry_run: bool) -> Panel:
-    btrfs = cfg.target_is_btrfs()
-    mode = {True: "btrfs send/receive", False: "compressed .btrfs.zst streams",
-            None: "unknown (target not mounted)"}[btrfs]
     text = Text()
     text.append("Btrfs Restore TUI - INCREMENTAL BACKUP" +
                 ("  (DRY RUN)\n" if dry_run else "\n"), style="bold green")
     text.append(f"Source:      {' '.join(cfg.source_mounts)}\n", style="white")
-    text.append(f"Destination: {cfg.snapshots_dir or '(no target detected)'}\n", style="white")
-    if cfg.remote_host:
-        text.append(f"Remote:      {cfg.remote_name} ({cfg.remote_host})\n", style="white")
+
+    targets = []
+    if cfg.target_root:
+        btrfs = cfg.target_is_btrfs()
+        mode = {True: "subvolumes", False: ".btrfs.zst streams",
+                None: "not mounted"}[btrfs]
+        targets.append(f"USB {cfg.snapshots_dir}  ({mode})")
+    if cfg.remote_host and cfg.remote_path:
+        targets.append(f"SSH {cfg.remote_name} {cfg.remote_host}:{cfg.remote_path}")
+    text.append("Targets:     " + ("\n             ".join(targets) or
+                "(none - plug USB or set REMOTE_HOST)") + "\n", style="white")
+
     text.append(f"Config:      {cfg.config_source}\n", style="dim white")
     cap = f", max {cfg.max_snapshots}" if cfg.max_snapshots else ""
-    text.append(f"Retention:   drive <= {cfg.max_disk_percent}%, keep >= "
-                f"{cfg.min_keep}{cap}\n", style="dim white")
-    text.append(f"Transport:   {mode}", style="dim green")
+    text.append(f"Retention:   USB drive <= {cfg.max_disk_percent}%, keep >= "
+                f"{cfg.min_keep}{cap};  local/SSH keep {cfg.local_keep}", style="dim white")
     return Panel(text, border_style="green")
 
 
@@ -113,11 +118,12 @@ def main() -> None:
 
     console.print(_header(cfg, args.dry_run))
 
-    if not cfg.target_root:
+    if not cfg.target_root and not (cfg.remote_host and cfg.remote_path):
         console.print(Panel(
             "[bold red]No backup target found.[/bold red]\n"
-            "Plug in the USB drive, or set [bold]TARGET_DIR[/bold] in "
-            "[bold]~/.config/restore-tui/config.conf[/bold].", border_style="red"))
+            "Plug in the USB drive, set [bold]TARGET_DIR[/bold], or configure "
+            "[bold]REMOTE_HOST[/bold] in [bold]~/.config/restore-tui/config.conf[/bold].",
+            border_style="red"))
         sys.exit(2)
 
     if args.quiet or args.dry_run:

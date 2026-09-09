@@ -19,6 +19,23 @@ def _human(n: float) -> str:
             return f"{n:.1f} {unit}"
         n /= 1024
 
+
+def build_ssh_args(config, user: str) -> List[str]:
+    """`ssh` + option flags as a list (never a shell string). Shared by the
+    backup engine (remote target) and the restore engine (staging)."""
+    from pathlib import Path
+    argv = ["ssh", "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ConnectTimeout=10", "-o", "BatchMode=yes"]
+    if getattr(config, "remote_port", 22) and config.remote_port != 22:
+        argv += ["-p", str(config.remote_port)]
+    key = Path(f"/home/{user}/.ssh/id_ed25519")
+    if key.exists():
+        argv += ["-i", str(key)]
+    kh = Path(f"/home/{user}/.ssh/known_hosts")
+    if kh.exists():
+        argv += ["-o", f"UserKnownHostsFile={kh}"]
+    return argv
+
 CommandError = subprocess.CalledProcessError
 
 ProgressCallback = Callable[[str], None]
@@ -193,12 +210,41 @@ class BtrfsOps:
             return self._send_pipe(self._send_argv(source, parent),
                                    ["zstd", f"-{level}", "-T0", "-c"], final_stdout=fh)
 
-    def send_ssh_receive(self, source: Path, parent: Optional[Path],
-                         ssh_args: List[str], remote: str,
-                         remote_receive_cmd: List[str]) -> int:
-        return self._send_pipe(self._send_argv(source, parent),
-                               ["ssh", *ssh_args, remote, *remote_receive_cmd])
-
     def disk_usage_percent(self, path: Path) -> float:
         u = shutil.disk_usage(path)
         return u.used * 100.0 / u.total if u.total else 0.0
+
+    # -- remote (SSH) helpers -----------------------------------------
+
+    def ssh_capture(self, ssh_argv: Sequence[str], remote: str,
+                    cmd_argv: Sequence[str], timeout: int = 25):
+        """Run `cmd_argv` on `remote`; return the CompletedProcess."""
+        return subprocess.run([*ssh_argv, remote, *cmd_argv],
+                              capture_output=True, text=True, timeout=timeout)
+
+    def send_ssh_receive(self, source: Path, parent: Optional[Path],
+                         ssh_argv: Sequence[str], remote: str,
+                         receive_argv: Sequence[str]) -> int:
+        sink = [*ssh_argv, remote, *receive_argv]
+        return self._send_pipe(self._send_argv(source, parent), sink)
+
+    def push_tree(self, local_dir: Path, ssh_argv: Sequence[str],
+                  remote: str, remote_dir: str) -> tuple:
+        """tar the local dir and untar it into remote_dir over ssh.
+        Returns (returncode, stderr_text)."""
+        mk = subprocess.run([*ssh_argv, remote, "mkdir", "-p", remote_dir],
+                            capture_output=True, text=True)
+        if mk.returncode != 0:
+            return mk.returncode, mk.stderr.strip()
+        tar = subprocess.Popen(
+            ["tar", "-C", str(local_dir), "-cf", "-", "."],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        recv = subprocess.Popen(
+            [*ssh_argv, remote, "tar", "-C", remote_dir, "-xf", "-"],
+            stdin=tar.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True)
+        if tar.stdout:
+            tar.stdout.close()
+        _, err = recv.communicate()
+        tar.wait()
+        return recv.returncode, (err.decode("utf-8", "replace").strip() if err else "")
