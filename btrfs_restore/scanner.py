@@ -25,6 +25,8 @@ class SnapshotScanner:
         self.snapshots_dir = snapshots_dir
         self.user = os.getenv("SUDO_USER") or os.getenv("USER") or getpass.getuser()
         self.config = Config.load()
+        self.remote_status = "none"          # none | unreachable | connected
+        self.remote_skipped_local = 0
 
     def scan_local_snapshots(self) -> List[SnapshotInfo]:
         """Scans /.snapshots for backup subvolumes and Snapper snapshots."""
@@ -306,8 +308,15 @@ class SnapshotScanner:
         return snapshots
 
     def scan_remote_snapshots(self) -> List[SnapshotInfo]:
-        """Scans remote native Btrfs subvolumes and archives on configured remote server via SSH."""
+        """Scans remote native Btrfs subvolumes and archives on configured remote server via SSH.
+
+        Sets self.remote_status: none | unreachable | connected, and
+        self.remote_skipped_local = how many remote subvolumes were hidden
+        because the same subvolume is already on local disk.
+        """
         snapshots: List[SnapshotInfo] = []
+        self.remote_status = "none"
+        self.remote_skipped_local = 0
         ip = self.config.remote_host
         remote_dest = self.config.remote_path
         if not ip or not remote_dest:
@@ -343,9 +352,16 @@ class SnapshotScanner:
         try:
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=16)
             if res.returncode != 0:
+                self.remote_status = "unreachable"
+                logger.warning("remote scan of %s failed: %s", ip,
+                               (res.stderr or "").strip() or f"exit {res.returncode}")
                 return snapshots
-        except (subprocess.SubprocessError, OSError):
+        except (subprocess.SubprocessError, OSError) as exc:
+            self.remote_status = "unreachable"
+            logger.warning("remote scan of %s failed: %s", ip, exc)
             return snapshots
+
+        self.remote_status = "connected"
 
         for line in res.stdout.strip().splitlines():
             line = line.strip()
@@ -362,6 +378,7 @@ class SnapshotScanner:
                 # Already on local disk? Don't offer a 30 GB re-download - the
                 # local scan lists the very same subvolume.
                 if (self.snapshots_dir / snap_name).is_dir():
+                    self.remote_skipped_local += 1
                     logger.info("remote %s is already local; not listing it as remote", snap_name)
                     continue
 

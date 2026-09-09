@@ -357,26 +357,44 @@ class BtrfsRestoreApp(App):
 
     @work(thread=True)
     def scan_remote_background(self) -> None:
-        """Scan remote server asynchronously in background thread."""
+        """Scan remote server asynchronously in background thread, and always
+        report the outcome so a silent 'nothing new' isn't mistaken for
+        'never connected'."""
+        name = self.scanner.config.remote_name or "Remote"
         try:
             remote_snaps = self.scanner.scan_remote_snapshots()
-            if remote_snaps:
-                remote_name = self.scanner.config.remote_name or "Remote"
-                existing_ids = {s.id for s in self.snapshots}
-                added = 0
-                for r in remote_snaps:
-                    if r.id not in existing_ids:
-                        self.snapshots.append(r)
-                        added += 1
-                if added > 0:
-                    self.snapshots.sort(key=lambda s: s.timestamp, reverse=True)
-                    self.app.call_from_thread(
-                        self.notify,
-                        f"📡 Connected to {remote_name}: {len(remote_snaps)} remote snapshots available",
-                        severity="information",
-                    )
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            self.app.call_from_thread(self.notify, f"⚠️ {name}: {exc}", severity="warning")
+            return
+
+        status = getattr(self.scanner, "remote_status", "none")
+        skipped = getattr(self.scanner, "remote_skipped_local", 0)
+
+        if status == "none":
+            return  # no remote configured - stay quiet
+        if status == "unreachable":
+            self.app.call_from_thread(
+                self.notify, f"⚠️ {name} no responde (revisá red / SSH / config)",
+                severity="warning")
+            return
+
+        existing = {s.id for s in self.snapshots}
+        added = [r for r in remote_snaps if r.id not in existing]
+        if added:
+            self.snapshots.extend(added)
+            self.snapshots.sort(key=lambda s: s.timestamp, reverse=True)
+            self.app.call_from_thread(
+                self.notify, f"📡 {name}: {len(added)} snapshot(s) sólo en remoto",
+                severity="information")
+        elif skipped:
+            self.app.call_from_thread(
+                self.notify,
+                f"📡 {name} conectado — sus {skipped} snapshots ya están en local",
+                severity="information")
+        else:
+            self.app.call_from_thread(
+                self.notify, f"📡 {name} conectado — sin snapshots",
+                severity="information")
 
     def load_snapshot_tree(self) -> None:
         if not self.current_snapshot:

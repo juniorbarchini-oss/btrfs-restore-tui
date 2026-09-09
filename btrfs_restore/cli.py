@@ -12,6 +12,7 @@ deferred: the menu and status run unprivileged; picking Backup or Restore
 re-execs that one command under sudo.
 """
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -27,8 +28,10 @@ _PRESERVE = ("WAYLAND_DISPLAY,DISPLAY,XDG_RUNTIME_DIR,TERM,COLORTERM,"
 console = Console()
 
 
-def _elevate_into(module_or_path: str, extra_args=None):
-    """Re-exec a single mode under sudo, preserving the terminal env."""
+def _run_mode(module_or_path: str, extra_args=None) -> int:
+    """Run one mode under sudo as a child process and return its exit code, so
+    control comes back to the menu afterwards. The child inherits the terminal
+    (stdin/stdout/stderr), so the TUI and the sudo prompt both work."""
     extra_args = extra_args or []
     os.environ["PYTHONPATH"] = f"{_PKG_ROOT}:{os.environ.get('PYTHONPATH', '')}".rstrip(":")
     if module_or_path.endswith(".py"):
@@ -36,16 +39,19 @@ def _elevate_into(module_or_path: str, extra_args=None):
     else:
         cmd = [sys.executable, "-m", module_or_path, *extra_args]
     if os.geteuid() != 0:
-        os.execvp("sudo", ["sudo", f"--preserve-env={_PRESERVE}", *cmd])
-    os.execvp(cmd[0], cmd)
+        cmd = ["sudo", f"--preserve-env={_PRESERVE}", *cmd]
+    try:
+        return subprocess.run(cmd).returncode
+    except KeyboardInterrupt:
+        return 130
 
 
-def _run_backup(argv):
-    _elevate_into("btrfs_restore.cli_backup", argv)
+def _run_backup(argv=None) -> int:
+    return _run_mode("btrfs_restore.cli_backup", argv or [])
 
 
-def _run_restore():
-    _elevate_into(str(_PKG_ROOT / "main.py"))
+def _run_restore() -> int:
+    return _run_mode(str(_PKG_ROOT / "main.py"))
 
 
 def _show_recovery_info():
@@ -69,10 +75,11 @@ def _show_recovery_info():
     console.print(Panel(body, border_style="#00FF66", title="[bold #00FF66]Recuperacion total[/]"))
 
 
-def _menu():
+def _print_menu():
     cfg = Config.load()
     host = os.uname().nodename
-    dest = cfg.target_root or cfg.remote_name if cfg.remote_host else "(sin destino)"
+    dest = (cfg.target_root or (cfg.remote_name if cfg.remote_host else None)
+            or "(sin destino - enchufá el USB)")
     header = Text()
     header.append("  BTRFS RESTORE TUI ", style="bold #00FF66")
     header.append("- AGY Time Machine\n", style="#00FF66")
@@ -83,15 +90,22 @@ def _menu():
     header.append("   [Q]  Salir", style="#00FF66")
     console.print(Panel(header, border_style="#00FF66"))
 
+
+def _menu() -> int:
+    _print_menu()
     while True:
         try:
             choice = console.input("[bold #00FF66]> [/]").strip().lower()
         except (EOFError, KeyboardInterrupt):
             return 0
         if choice in ("b", "backup"):
-            _run_backup([])
+            _run_backup()
+            console.print()
+            _print_menu()
         elif choice in ("r", "restore", "restaurar"):
             _run_restore()
+            console.print()
+            _print_menu()
         elif choice in ("f", "full"):
             _show_recovery_info()
         elif choice in ("q", "quit", "salir", ""):
@@ -103,9 +117,9 @@ def _menu():
 def main() -> None:
     args = sys.argv[1:]
     if args and args[0] in ("backup", "backup-now"):
-        _run_backup(args[1:])
+        sys.exit(_run_backup(args[1:]))
     elif args and args[0] in ("restore", "restore-now"):
-        _run_restore()
+        sys.exit(_run_restore())
     elif args and args[0] in ("-h", "--help"):
         console.print(__doc__ or "")
     else:
