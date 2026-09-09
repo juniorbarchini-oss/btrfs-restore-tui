@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Single entry point: shows the Backup / Restore / Recovery menu.
+SOURCE_FILE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE_FILE" ]; do
+    DIR="$(cd -P "$(dirname "$SOURCE_FILE")" && pwd)"
+    SOURCE_FILE="$(readlink "$SOURCE_FILE")"
+    [[ $SOURCE_FILE != /* ]] && SOURCE_FILE="$DIR/$SOURCE_FILE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE_FILE")/.." && pwd)"
+if [ -d "/opt/btrfs-restore-tui/.venv" ]; then
+    PY="/opt/btrfs-restore-tui/.venv/bin/python3"; export PYTHONPATH="/opt/btrfs-restore-tui:${PYTHONPATH:-}"
+elif [ -d "${SCRIPT_DIR}/.venv" ]; then
+    PY="${SCRIPT_DIR}/.venv/bin/python3"; export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH:-}"
+else
+    PY="python3"; export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH:-}"
+fi
+exec "$PY" -m btrfs_restore.cli "$@"
