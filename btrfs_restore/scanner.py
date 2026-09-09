@@ -359,6 +359,12 @@ class SnapshotScanner:
                 if not (snap_name.startswith("home_") or snap_name.startswith("root_")):
                     continue
 
+                # Already on local disk? Don't offer a 30 GB re-download - the
+                # local scan lists the very same subvolume.
+                if (self.snapshots_dir / snap_name).is_dir():
+                    logger.info("remote %s is already local; not listing it as remote", snap_name)
+                    continue
+
                 target_kind = "Home" if sub_path.startswith("home") else "Root /"
                 match = re.search(r"(\d{8}_\d{6})", snap_name)
                 if match:
