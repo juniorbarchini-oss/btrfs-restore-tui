@@ -60,6 +60,9 @@ _LEGACY_FILE_KEYS = {
     "BTRFS_REMOTE_PORT": "REMOTE_PORT",
 }
 
+# Legacy-key / legacy-env deprecation is logged once per key per process.
+_WARNED_LEGACY: set = set()
+
 
 def _current_user() -> str:
     return os.getenv("SUDO_USER") or os.getenv("USER") or getpass.getuser()
@@ -116,7 +119,8 @@ def _read_config_file(user: str) -> dict:
         except OSError:
             return {}
 
-        if legacy_seen:
+        if legacy_seen and str(path) not in _WARNED_LEGACY:
+            _WARNED_LEGACY.add(str(path))
             canon = sorted({_LEGACY_FILE_KEYS[k] for k in legacy_seen})
             logger.warning(
                 "config %s uses deprecated keys %s - rename to %s",
@@ -137,7 +141,8 @@ def _env(name: str) -> Optional[str]:
     legacy = os.getenv("BTRFS_" + name)
     if legacy in (None, "") and name.startswith("REMOTE_"):
         legacy = os.getenv("BTRFS_REMOTE_" + name[len("REMOTE_"):])
-    if legacy not in (None, ""):
+    if legacy not in (None, "") and f"env:{name}" not in _WARNED_LEGACY:
+        _WARNED_LEGACY.add(f"env:{name}")
         logger.warning("env BTRFS_%s is deprecated - use %s%s", name, _ENV_PREFIX, name)
     return legacy
 
