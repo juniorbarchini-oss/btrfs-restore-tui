@@ -11,15 +11,17 @@ from btrfs_restore import cli
 
 class TestCliDispatch(unittest.TestCase):
     def test_backup_subcommand_routes_to_backup(self):
-        with mock.patch.object(cli, "_run_backup") as rb, \
+        with mock.patch.object(cli, "_run_backup", return_value=0) as rb, \
              mock.patch.object(sys, "argv", ["restore-tui", "backup", "--dry-run"]):
-            cli.main()
+            with self.assertRaises(SystemExit):
+                cli.main()
         rb.assert_called_once_with(["--dry-run"])
 
     def test_restore_subcommand_routes_to_restore(self):
-        with mock.patch.object(cli, "_run_restore") as rr, \
+        with mock.patch.object(cli, "_run_restore", return_value=0) as rr, \
              mock.patch.object(sys, "argv", ["restore-tui", "restore"]):
-            cli.main()
+            with self.assertRaises(SystemExit):
+                cli.main()
         rr.assert_called_once()
 
     def test_menu_q_exits_cleanly(self):
@@ -30,16 +32,19 @@ class TestCliDispatch(unittest.TestCase):
                 cli.main()
         self.assertEqual(e.exception.code, 0)
 
-    def test_menu_b_then_backup(self):
-        calls = iter(["b"])
+    def test_menu_b_runs_backup_then_returns_to_menu(self):
+        answers = iter(["b", "q"])
         with mock.patch.object(sys, "argv", ["restore-tui"]), \
-             mock.patch.object(cli.console, "input", side_effect=lambda *_: next(calls)), \
+             mock.patch.object(cli.console, "input", side_effect=lambda *_: next(answers)), \
              mock.patch.object(cli.console, "print"), \
-             mock.patch.object(cli, "_run_backup") as rb:
-            rb.side_effect = SystemExit(0)   # _run_backup normally execs away
-            with self.assertRaises(SystemExit):
+             mock.patch.object(cli, "_print_menu") as pm, \
+             mock.patch.object(cli, "_run_backup", return_value=0) as rb:
+            with self.assertRaises(SystemExit) as e:
                 cli.main()
-        rb.assert_called_once_with([])
+        rb.assert_called_once()
+        self.assertEqual(e.exception.code, 0)
+        # menu redrawn after backup returned (initial + after-backup)
+        self.assertGreaterEqual(pm.call_count, 2)
 
     def test_menu_rejects_garbage_then_quits(self):
         answers = iter(["xyz", "q"])
@@ -51,15 +56,25 @@ class TestCliDispatch(unittest.TestCase):
                 cli.main()
         self.assertTrue(any("Opcion" in str(a) for a in seen))
 
-    def test_elevate_builds_module_command_when_root(self):
+    def test_run_mode_builds_module_command_and_returns_code(self):
         with mock.patch.object(cli.os, "geteuid", return_value=0), \
-             mock.patch.object(cli.os, "execvp") as ex, \
+             mock.patch.object(cli.subprocess, "run",
+                               return_value=mock.Mock(returncode=7)) as sr, \
              mock.patch.dict(cli.os.environ, {}, clear=True):
-            cli._elevate_into("btrfs_restore.cli_backup", ["--dry-run"])
-        argv = ex.call_args[0][1]
+            rc = cli._run_mode("btrfs_restore.cli_backup", ["--dry-run"])
+        self.assertEqual(rc, 7)
+        argv = sr.call_args[0][0]
         self.assertIn("-m", argv)
         self.assertIn("btrfs_restore.cli_backup", argv)
         self.assertIn("--dry-run", argv)
+        self.assertNotIn("sudo", argv)   # already root
+
+    def test_run_mode_prepends_sudo_when_not_root(self):
+        with mock.patch.object(cli.os, "geteuid", return_value=1000), \
+             mock.patch.object(cli.subprocess, "run",
+                               return_value=mock.Mock(returncode=0)) as sr:
+            cli._run_mode("btrfs_restore.cli_backup")
+        self.assertEqual(sr.call_args[0][0][0], "sudo")
 
 
 if __name__ == "__main__":
