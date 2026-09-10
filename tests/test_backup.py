@@ -94,7 +94,7 @@ class FakeBtrfsOps:
         self.remote_subvols.setdefault(kind, []).append(source.name)
         return 0
 
-    def push_tree(self, local_dir, ssh_argv, remote, remote_dir):
+    def push_tree(self, local_dir, ssh_argv, remote, remote_dir, timeout=120):
         return 0, ""
 
 
@@ -372,6 +372,38 @@ class TestBackupExclusions(BackupTestBase):
         self.assertTrue((local_home / "hbarchini" / ".cache").exists())
         man = json.loads((cfg.snapshots_dir / r.snapshot_name / "manifest.json").read_text())
         self.assertEqual(man["excluded"], {})
+
+
+class TestBackupScratchCleanup(BackupTestBase):
+    def test_run_leaves_no_scratch_dir_and_keeps_last_log(self):
+        cfg = self.make_cfg()
+        r = BtrfsBackupEngine(cfg, ops=FakeBtrfsOps(target_is_btrfs=True)).run()
+        self.assertEqual(r.status, "completed", r.message)
+        tmp_root = self.local_snaps / ".backup-tmp"
+        leftover = [p for p in tmp_root.iterdir()] if tmp_root.is_dir() else []
+        self.assertEqual(leftover, [])
+        self.assertTrue((self.local_snaps / ".backup-last.log").is_file())
+
+    def test_sweep_removes_dead_pid_dirs_only(self):
+        cfg = self.make_cfg()
+        eng = BtrfsBackupEngine(cfg)
+        tmp_root = self.local_snaps / ".backup-tmp"
+        tmp_root.mkdir(parents=True)
+        dead = tmp_root / "999999999-20200101_000000"      # pid can't be alive
+        alive = tmp_root / f"{os.getpid()}-20200101_000000"
+        for d in (dead, alive):
+            d.mkdir()
+            (d / "x").write_text("scratch")
+        # legacy residue from the pre-1d scheme, aged past the 6h cutoff
+        legacy = self.local_snaps / ".state-20200101_000000"
+        legacy.mkdir()
+        old = _dtmod.datetime(2020, 1, 1).timestamp()
+        os.utime(legacy, (old, old))
+
+        eng._sweep_stale_tmp()
+        self.assertFalse(dead.exists())
+        self.assertTrue(alive.exists())
+        self.assertFalse(legacy.exists())
 
 
 class TestBackupDryRun(BackupTestBase):

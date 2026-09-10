@@ -270,11 +270,15 @@ class BtrfsOps:
         return self._send_pipe(self._send_argv(source, parent), sink)
 
     def push_tree(self, local_dir: Path, ssh_argv: Sequence[str],
-                  remote: str, remote_dir: str) -> tuple:
-        """tar the local dir and untar it into remote_dir over ssh.
-        Returns (returncode, stderr_text)."""
-        mk = subprocess.run([*ssh_argv, remote, "mkdir", "-p", remote_dir],
-                            capture_output=True, text=True)
+                  remote: str, remote_dir: str, timeout: int = 120) -> tuple:
+        """tar the local dir and untar it into remote_dir over ssh, giving up
+        after `timeout` seconds so a stalled link (Tailscale hiccup) can't hang
+        the whole backup. Returns (returncode, stderr_text); 124 == timed out."""
+        try:
+            mk = subprocess.run([*ssh_argv, remote, "mkdir", "-p", remote_dir],
+                                capture_output=True, text=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            return 124, "timed out creating remote dir"
         if mk.returncode != 0:
             return mk.returncode, mk.stderr.strip()
         tar = subprocess.Popen(
@@ -286,6 +290,16 @@ class BtrfsOps:
             start_new_session=True)
         if tar.stdout:
             tar.stdout.close()
-        _, err = recv.communicate()
+        try:
+            _, err = recv.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            for p in (recv, tar):
+                p.kill()
+            try:
+                recv.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            tar.wait()
+            return 124, f"timed out after {timeout}s"
         tar.wait()
         return recv.returncode, (err.decode("utf-8", "replace").strip() if err else "")

@@ -70,6 +70,24 @@ class TestPrunePaths(unittest.TestCase):
             self.assertEqual(prune_paths(Path(d), ["nope/*", "*/.cache"]), [])
 
 
+class TestPushTreeTimeout(unittest.TestCase):
+    def test_stalled_receiver_times_out_with_124(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "src"
+            src.mkdir()
+            (src / "f").write_text("hi")
+            ops = BtrfsOps()
+            # ssh_argv=["sh","-c"] so the "remote" is a shell script; it sleeps
+            # only for the receive step (argv0 == "tar"), not the mkdir step.
+            rc, err = ops.push_tree(
+                src, ["sh", "-c"],
+                'case "$0" in tar) exec sleep 5;; esac',
+                str(Path(d) / "dest"), timeout=1,
+            )
+        self.assertEqual(rc, 124)
+        self.assertIn("timed out", err)
+
+
 class TestHuman(unittest.TestCase):
     def test_units(self):
         self.assertEqual(_human(0), "0.0 B")
