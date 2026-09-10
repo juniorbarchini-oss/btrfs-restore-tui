@@ -359,6 +359,37 @@ class TestBackupExclusions(BackupTestBase):
         self.assertIn("homefs", man["excluded"])
         self.assertIn("hbarchini/.cache", man["excluded"]["homefs"])
 
+    def test_default_list_catches_browser_caches(self):
+        u = self.fake_home_src / "hbarchini"
+        chrome = u / ".config" / "google-chrome" / "Default"
+        (chrome / "Cache" / "Cache_Data").mkdir(parents=True)
+        (chrome / "Cache" / "Cache_Data" / "b").write_bytes(b"y" * 8192)
+        (chrome / "GPUCache").mkdir(parents=True)
+        (chrome / "Service Worker" / "CacheStorage").mkdir(parents=True)
+        (chrome / "Preferences").write_text("{}")            # must survive
+        (u / ".cache").mkdir()
+        code = u / ".config" / "Code"
+        (code / "CachedData").mkdir(parents=True)
+
+        cfg = self.make_cfg()
+        # sandbox mounts aren't literally "/home", so pull the real default
+        # /home list and run it against this realistic tree
+        from btrfs_restore.config import DEFAULT_BTRFS_EXCLUSIONS
+        cfg.exclude_defaults = False
+        cfg.extra_exclusions = list(DEFAULT_BTRFS_EXCLUSIONS["/home"])
+        ops = FakeBtrfsOps(target_is_btrfs=True)
+        r = BtrfsBackupEngine(cfg, ops=ops).run()
+        self.assertEqual(r.status, "completed", r.message)
+
+        h = next(p for p in self.local_snaps.iterdir() if p.name.startswith("homefs_"))
+        c = h / "hbarchini" / ".config" / "google-chrome" / "Default"
+        self.assertFalse((c / "Cache").exists())
+        self.assertFalse((c / "GPUCache").exists())
+        self.assertFalse((c / "Service Worker" / "CacheStorage").exists())
+        self.assertTrue((c / "Preferences").exists())
+        self.assertFalse((h / "hbarchini" / ".config" / "Code" / "CachedData").exists())
+        self.assertFalse((h / "hbarchini" / ".cache").exists())
+
     def test_no_exclusions_uses_plain_ro_snapshot(self):
         self._seed_caches()
         cfg = self.make_cfg()

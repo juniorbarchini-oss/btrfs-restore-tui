@@ -112,6 +112,13 @@ class TestConfig(unittest.TestCase):
         self.assertIn("var/tmp/*", root_ex)
         self.assertIn("Downloads/big/", root_ex)    # extras apply to every mount
 
+    def test_default_home_list_covers_browser_caches(self):
+        home_ex = Config().exclusions_for("/home")
+        for pat in ("*/.cache", "*/.config/*/*/Cache", "*/.config/*/*/Code Cache",
+                    "*/.config/*/*/GPUCache", "*/.config/*/CachedData",
+                    "*/.config/*/*/Service Worker/CacheStorage"):
+            self.assertIn(pat, home_ex)
+
     def test_exclude_defaults_off(self):
         self.cfg_file.write_text("EXCLUDE_DEFAULTS=off\nEXCLUDE=*/.cache\n")
         cfg = Config.load()
