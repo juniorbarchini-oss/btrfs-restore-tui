@@ -421,6 +421,12 @@ class BtrfsRestoreApp(App):
                 self.notify, f"⚠️ {name} not responding (check network / SSH / config)",
                 severity="warning")
             return
+        if status == "no_privilege":
+            self.app.call_from_thread(
+                self.notify,
+                f"⚠️ {name} connected, but 'sudo btrfs' is not allowed there - "
+                "listing what's readable without root only",
+                severity="warning")
 
         existing = {s.id for s in self.snapshots}
         added = [r for r in remote_snaps if r.id not in existing]

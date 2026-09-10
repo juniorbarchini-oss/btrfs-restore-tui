@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import getpass
+import shlex
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -25,7 +26,12 @@ class SnapshotScanner:
         self.snapshots_dir = snapshots_dir
         self.user = os.getenv("SUDO_USER") or os.getenv("USER") or getpass.getuser()
         self.config = Config.load()
-        self.remote_status = "none"          # none | unreachable | connected
+        # none      - no remote configured
+        # unreachable - SSH did not connect (network / auth / host down)
+        # no_privilege - connected, but `sudo btrfs` is not allowed there; only
+        #                what is readable without root is listed
+        # connected  - connected and `sudo btrfs` works
+        self.remote_status = "none"
         self.remote_skipped_local = 0
 
     def scan_local_snapshots(self) -> List[SnapshotInfo]:
@@ -310,8 +316,8 @@ class SnapshotScanner:
     def scan_remote_snapshots(self) -> List[SnapshotInfo]:
         """Scans remote native Btrfs subvolumes and archives on configured remote server via SSH.
 
-        Sets self.remote_status: none | unreachable | connected, and
-        self.remote_skipped_local = how many remote subvolumes were hidden
+        Sets self.remote_status: none | unreachable | no_privilege | connected,
+        and self.remote_skipped_local = how many remote subvolumes were hidden
         because the same subvolume is already on local disk.
         """
         snapshots: List[SnapshotInfo] = []
@@ -337,11 +343,22 @@ class SnapshotScanner:
         if known_hosts.exists():
             cmd.extend(["-o", f"UserKnownHostsFile={known_hosts}"])
 
-        # Query native subvolumes in remote backup destination
-        remote_cmd = (
-            f"sudo btrfs subvolume list {remote_dest} 2>/dev/null; "
-            f"ls -l --time-style=+%Y-%m-%d\\ %H:%M:%S {remote_dest}/*.btrfs.zst 2>/dev/null || true"
-        )
+        # One SSH round-trip that also tells us *why* it failed:
+        #   __CONN_OK__   - the SSH session itself worked
+        #   __SUDO_OK__   - `sudo btrfs` is allowed (full listing follows)
+        #   __SUDO_NO__   - connected but no passwordless `sudo btrfs`; fall back
+        #                   to a plain `find` of the received-subvolume dirs
+        # `sudo -n` fails fast instead of blocking on a password prompt.
+        q = shlex.quote
+        dest = str(remote_dest).rstrip("/")
+        remote_cmd = "; ".join([
+            "echo __CONN_OK__",
+            f"if sudo -n btrfs subvolume list {q(dest)} 2>/dev/null; then echo __SUDO_OK__; "
+            f"else echo __SUDO_NO__; "
+            f"find {q(dest)}/root {q(dest)}/home -mindepth 1 -maxdepth 1 "
+            f"-printf 'nosudo %p\\n' 2>/dev/null || true; fi",
+            f"ls -l --time-style=+%Y-%m-%d\\ %H:%M:%S {q(dest)}/*.btrfs.zst 2>/dev/null || true",
+        ])
         cmd.extend([
             "-o", "StrictHostKeyChecking=no",
             "-o", "ConnectTimeout=5",
@@ -351,21 +368,56 @@ class SnapshotScanner:
         ])
         try:
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=16)
-            if res.returncode != 0:
-                self.remote_status = "unreachable"
-                logger.warning("remote scan of %s failed: %s", ip,
-                               (res.stderr or "").strip() or f"exit {res.returncode}")
-                return snapshots
         except (subprocess.SubprocessError, OSError) as exc:
             self.remote_status = "unreachable"
             logger.warning("remote scan of %s failed: %s", ip, exc)
             return snapshots
 
-        self.remote_status = "connected"
+        if res.returncode != 0 or "__CONN_OK__" not in res.stdout:
+            self.remote_status = "unreachable"
+            logger.warning("remote scan of %s failed: %s", ip,
+                           (res.stderr or "").strip() or f"exit {res.returncode}")
+            return snapshots
+
+        if "__SUDO_OK__" in res.stdout:
+            self.remote_status = "connected"
+        else:
+            self.remote_status = "no_privilege"
+            logger.info("remote %s: connected but no passwordless `sudo btrfs` - "
+                        "listing received-subvolume dirs by name only", ip)
 
         for line in res.stdout.strip().splitlines():
             line = line.strip()
-            if not line:
+            if not line or line.startswith("__"):
+                continue
+
+            # No-privilege fallback: `find` output, one absolute path per line
+            if line.startswith("nosudo "):
+                full = line[len("nosudo "):].strip()
+                snap_name = full.rsplit("/", 1)[-1]
+                kind_seg = full.rsplit("/", 2)[-2] if full.count("/") >= 2 else ""
+                if kind_seg not in ("root", "home"):
+                    continue
+                if not (snap_name.startswith("home_") or snap_name.startswith("root_")):
+                    continue
+                if (self.snapshots_dir / snap_name).is_dir():
+                    self.remote_skipped_local += 1
+                    continue
+                m = re.search(r"(\d{8}_\d{6})", snap_name)
+                try:
+                    ptime = datetime.strptime(m.group(1), "%Y%m%d_%H%M%S") if m else datetime.now()
+                except ValueError:
+                    ptime = datetime.now()
+                kind_label = "Home" if kind_seg == "home" else "Root /"
+                snapshots.append(SnapshotInfo(
+                    id=f"remote_{snap_name}",
+                    name=f"{remote_name}: {kind_label} [{ptime.strftime('%d-%b %H:%M')}]",
+                    path=Path(full),
+                    snap_type=SnapshotType.REMOTE,
+                    timestamp=ptime,
+                    description=f"Remote Btrfs subvolume on {remote_name} ({full})",
+                    is_subvolume=True,
+                ))
                 continue
 
             # Case A: btrfs subvolume list output

@@ -93,20 +93,50 @@ class TestScanTarget(unittest.TestCase):
         self.assertTrue(all(not s.is_subvolume for s in snaps))
         self.assertTrue(all(s.path.suffix == ".zst" for s in snaps))
 
+    def _remote_scanner(self):
+        sc = self.scanner()
+        sc.config.remote_host = "10.0.0.9"
+        sc.config.remote_path = "/backups"
+        return sc
+
     def test_remote_subvolume_already_local_is_not_listed_as_remote(self):
         # a local /.snapshots that already holds home_20260908_173356
         local_dot = Path(self.tmp.name) / "dotsnaps"
         (local_dot / "home_20260908_173356").mkdir(parents=True)
-        sc = self.scanner()
+        sc = self._remote_scanner()
         sc.snapshots_dir = local_dot
-        sc.config.remote_host = "10.0.0.9"
-        sc.config.remote_path = "/backups"
-        fake_ssh_out = "ID 256 gen 9 top level 5 path home/home_20260908_173356\n"
+        fake_ssh_out = ("__CONN_OK__\n"
+                        "ID 256 gen 9 top level 5 path home/home_20260908_173356\n"
+                        "__SUDO_OK__\n")
         with mock.patch("subprocess.run") as sr:
             sr.return_value = mock.Mock(returncode=0, stdout=fake_ssh_out, stderr="")
             with self.assertLogs("btrfs_restore", level="INFO"):
                 remote = sc.scan_remote_snapshots()
         self.assertEqual(remote, [])
+        self.assertEqual(sc.remote_status, "connected")
+        self.assertEqual(sc.remote_skipped_local, 1)
+
+    def test_ssh_connects_but_no_output_marker_is_unreachable(self):
+        sc = self._remote_scanner()
+        with mock.patch("subprocess.run") as sr:
+            sr.return_value = mock.Mock(returncode=255, stdout="", stderr="Permission denied")
+            remote = sc.scan_remote_snapshots()
+        self.assertEqual(remote, [])
+        self.assertEqual(sc.remote_status, "unreachable")
+
+    def test_connected_without_sudo_falls_back_to_find(self):
+        sc = self._remote_scanner()
+        sc.snapshots_dir = Path(self.tmp.name) / "empty-dotsnaps"
+        fake = ("__CONN_OK__\n__SUDO_NO__\n"
+                "nosudo /backups/root/root_20260909_230829\n"
+                "nosudo /backups/home/home_20260909_230829\n")
+        with mock.patch("subprocess.run") as sr:
+            sr.return_value = mock.Mock(returncode=0, stdout=fake, stderr="")
+            remote = sc.scan_remote_snapshots()
+        self.assertEqual(sc.remote_status, "no_privilege")
+        self.assertEqual(sorted(s.path.name for s in remote),
+                         ["home_20260909_230829", "root_20260909_230829"])
+        self.assertTrue(all(s.is_subvolume for s in remote))
 
     def test_missing_manifest_is_a_warning_not_a_crash(self):
         d = self.snaps / "2026-09-08_180000"
