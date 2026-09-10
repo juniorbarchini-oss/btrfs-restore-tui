@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # System installer for Btrfs Restore TUI (AGY Time Machine)
-# Deploys to /opt/btrfs-restore-tui with global commands in /usr/local/bin.
-# (venv creation lands in #4; for now the bin/ shims fall back to system python)
+# Deploys to /opt/btrfs-restore-tui with global commands in /usr/local/bin,
+# and builds a self-contained Python venv there so the app never depends on
+# system-wide site-packages. If the venv can't be built (no network, no venv
+# module) the bin/ shims still fall back to the system python.
 # ==============================================================================
 set -euo pipefail
 
@@ -15,7 +17,8 @@ DESKTOP_ENTRY="/usr/share/applications/btrfs-restore.desktop"
 
 # --upgrade / --force accepted for forward-compat; install.sh is already
 # idempotent and never touches snapshots or an existing config.
-for a in "$@"; do case "$a" in --upgrade|--force) ;; *) echo "unknown option: $a"; exit 2 ;; esac; done
+FORCE=0
+for a in "$@"; do case "$a" in --upgrade|--force) FORCE=1 ;; *) echo "unknown option: $a"; exit 2 ;; esac; done
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "[!] needs root - re-running with sudo"
@@ -43,6 +46,37 @@ rm -rf "${INSTALL_DIR:?}/btrfs_restore" "${INSTALL_DIR:?}/bin" "${INSTALL_DIR:?}
 cp -r "${SRC_DIR}/btrfs_restore" "${SRC_DIR}/bin" "${SRC_DIR}/main.py" \
       "${SRC_DIR}/requirements.txt" "${SRC_DIR}/config.conf.example" "${INSTALL_DIR}/"
 chmod +x "${INSTALL_DIR}/main.py" "${INSTALL_DIR}/bin/"*
+
+# --- self-contained Python environment ---------------------------------------
+# The bin/ shims prefer ${INSTALL_DIR}/.venv and only fall back to the system
+# python when it is absent, so a working venv here is what makes the app
+# portable to a clean machine.
+VENV_DIR="${INSTALL_DIR}/.venv"
+if [ "${FORCE}" -eq 1 ] && [ -d "${VENV_DIR}" ]; then
+    echo "--> rebuilding ${VENV_DIR}"
+    rm -rf "${VENV_DIR}"
+fi
+if [ ! -d "${VENV_DIR}" ]; then
+    if ! python3 -c 'import venv' 2>/dev/null; then
+        echo "[!] python3 'venv' module missing."
+        echo "    Arch:   it ships with the python package - check your install."
+        echo "    Debian/Ubuntu:  sudo apt install python3-venv"
+        echo "    Skipping the venv; the app will use system python packages instead."
+    elif python3 -m venv "${VENV_DIR}"; then
+        echo "--> ${VENV_DIR}"
+        if "${VENV_DIR}/bin/pip" install --quiet --upgrade pip \
+           && "${VENV_DIR}/bin/pip" install --quiet -r "${INSTALL_DIR}/requirements.txt"; then
+            echo "    installed: $(tr '\n' ' ' < "${INSTALL_DIR}/requirements.txt")"
+        else
+            echo "[!] could not install dependencies (offline?). Removing the half-built venv;"
+            echo "    the app will fall back to system python. Re-run with --force when online."
+            rm -rf "${VENV_DIR}"
+        fi
+    else
+        echo "[!] 'python3 -m venv' failed; the app will use system python packages."
+        rm -rf "${VENV_DIR}"
+    fi
+fi
 
 echo "--> /usr/local/bin/{restore-tui,restore-now,backup-now}"
 ln -sf "${INSTALL_DIR}/bin/restore-tui"  /usr/local/bin/restore-tui
