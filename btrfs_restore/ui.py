@@ -410,7 +410,7 @@ class BtrfsRestoreApp(App):
             return  # no remote configured - stay quiet
         if status == "unreachable":
             self.app.call_from_thread(
-                self.notify, f"⚠️ {name} no responde (revisá red / SSH / config)",
+                self.notify, f"⚠️ {name} not responding (check network / SSH / config)",
                 severity="warning")
             return
 
@@ -420,16 +420,16 @@ class BtrfsRestoreApp(App):
             self.snapshots.extend(added)
             self.snapshots.sort(key=lambda s: s.timestamp, reverse=True)
             self.app.call_from_thread(
-                self.notify, f"📡 {name}: {len(added)} snapshot(s) sólo en remoto",
+                self.notify, f"📡 {name}: {len(added)} snapshot(s) only on the remote",
                 severity="information")
         elif skipped:
             self.app.call_from_thread(
                 self.notify,
-                f"📡 {name} conectado — sus {skipped} snapshots ya están en local",
+                f"📡 {name} connected — its {skipped} snapshot(s) are already local",
                 severity="information")
         else:
             self.app.call_from_thread(
-                self.notify, f"📡 {name} conectado — sin snapshots",
+                self.notify, f"📡 {name} connected — no snapshots",
                 severity="information")
 
     def load_snapshot_tree(self) -> None:
