@@ -30,6 +30,16 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+class _FatalRestore(RuntimeError):
+    """Raised inside the rsync helper for an unrecoverable condition (disk full)
+    so restore_generator can abort the whole run with fatal=True."""
+
+
+# out-format fields split on the unit separator (never valid in a path component)
+_RSYNC_SEP = "\x1f"
+_RSYNC_FMT = f">>%i{_RSYNC_SEP}%l{_RSYNC_SEP}%n"
+
+
 class RestoreEngine:
     def __init__(self):
         self._active_procs: List[subprocess.Popen] = []
@@ -190,6 +200,78 @@ class RestoreEngine:
             idx += 1
         return bak
 
+    # -- fast directory copy via rsync -------------------------------------
+    #
+    # A per-file Python copy loop is slow for a big tree and does not carry
+    # ACLs, xattrs, hardlinks or sparse regions. rsync does all of that in one
+    # process; we parse its --out-format stream to keep the progress bar live.
+
+    def _rsync_argv(self, src_dir: Path, dest_dir: Path,
+                    resolution: ConflictResolution, to_user: bool) -> List[str]:
+        root = os.geteuid() == 0
+        argv = ["rsync", "-rlptD", "--out-format=" + _RSYNC_FMT]
+        if root:
+            # -A/-X (ACLs, xattrs) and owner/group only make sense as root and
+            # can hard-error on a filesystem that lacks them otherwise.
+            argv += ["-AXH", "-S", "-go", "--numeric-ids"]
+            if to_user:
+                argv.append(f"--chown={self.target_uid}:{self.target_gid}")
+        if resolution == ConflictResolution.SKIP:
+            argv.append("--ignore-existing")
+        elif resolution == ConflictResolution.BACKUP:
+            argv += ["--backup", "--suffix=.bak"]
+        # OVERWRITE == rsync default
+        argv += ["--", f"{src_dir}/", f"{dest_dir}/"]
+        return argv
+
+    def _rsync_item(self, src_dir: Path, dest_dir: Path,
+                    resolution: ConflictResolution, to_user: bool):
+        """Copy `src_dir` into `dest_dir` with rsync. Yields
+        ('progress', n_files, n_bytes, last_name) as work lands and
+        ('error', message) for a partial-transfer failure. Raises _FatalRestore
+        on ENOSPC."""
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        argv = self._rsync_argv(src_dir, dest_dir, resolution, to_user)
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, start_new_session=True)
+        self._active_procs = [proc]
+        n_files = n_bytes = 0
+        last_name = ""
+        try:
+            for line in proc.stdout:
+                if not line.startswith(">>"):
+                    continue
+                try:
+                    itemize, length, name = line[2:].rstrip("\n").split(_RSYNC_SEP, 2)
+                except ValueError:
+                    continue
+                if len(itemize) > 1 and itemize[1] in ("f", "L"):   # regular file / symlink
+                    n_files += 1
+                    try:
+                        n_bytes += int(length)
+                    except ValueError:
+                        pass
+                    last_name = name.rsplit("/", 1)[-1]
+                    if n_files >= 64:
+                        yield ("progress", n_files, n_bytes, last_name)
+                        n_files = n_bytes = 0
+            proc.wait()
+        finally:
+            self._active_procs = []
+        if n_files:
+            yield ("progress", n_files, n_bytes, last_name)
+
+        err = (proc.stderr.read() or "").strip()
+        rc = proc.returncode
+        if rc in (0, 24):          # 24 == source files vanished during the run
+            return
+        if rc == 11 or "No space left" in err:
+            raise _FatalRestore(f"Disk full while restoring {dest_dir.name}")
+        for eline in [e for e in err.splitlines() if e][:8]:
+            yield ("error", eline)
+        if rc != 23:               # 23 == partial transfer (some files failed)
+            yield ("error", f"rsync exited {rc} for {src_dir.name}")
+
     def restore_generator(
         self,
         items: List[RestoreItem],
@@ -244,6 +326,9 @@ class RestoreEngine:
                          error=f"Cannot write to {target_base}: {exc}")
             return
 
+        use_rsync = shutil.which("rsync") is not None
+        dir_items = [it for it in items if it.is_dir]
+
         all_files_to_copy = []
         dirs_to_make = []          # (src_dir, rel) - recreated even when empty
         for item in items:
@@ -275,7 +360,35 @@ class RestoreEngine:
             except OSError as exc:
                 errors.append(f"{rel}/: {exc.strerror or exc}")
 
-        for src, rel in all_files_to_copy:
+        # -- directory selections: one rsync each (fast, carries ACLs / xattrs /
+        #    hardlinks / sparse regions). Standalone files stay on the per-file
+        #    path below so its conflict + error handling is unchanged. --
+        if use_rsync and dir_items:
+            for item in dir_items:
+                dest_dir = target_base / item.rel_path
+                try:
+                    for ev in self._rsync_item(item.source_path, dest_dir,
+                                               resolution, to_user):
+                        if ev[0] == "progress":
+                            _, n_files, n_bytes, name = ev
+                            processed_files += n_files
+                            processed_bytes += n_bytes
+                            spinner_frame = (spinner_frame + 1) % 4
+                            yield _state(current_file=name)
+                        else:
+                            errors.append(f"{item.rel_path}: {ev[1]}")
+                            yield _state(current_file=f"! {item.rel_path.name}")
+                except _FatalRestore as exc:
+                    yield _state(current_file="", done=True, fatal=True,
+                                 error=f"{exc} - aborted with "
+                                       f"{processed_files}/{total_files} done")
+                    return
+            files_to_process = [(it.source_path, it.rel_path)
+                                for it in items if not it.is_dir]
+        else:
+            files_to_process = all_files_to_copy
+
+        for src, rel in files_to_process:
             dest = target_base / rel
             try:
                 # -- existing-file conflict --
@@ -336,6 +449,10 @@ class RestoreEngine:
             yield _state(current_file="Completed with errors", done=True,
                          error=f"{len(errors)}/{total_files} file(s) failed:\n{shown}")
         else:
+            # rsync's transferred-file count can differ slightly from the walk
+            # count (unchanged files, dir entries); land the bar at 100%.
+            processed_files = max(processed_files, total_files)
+            processed_bytes = max(processed_bytes, total_bytes)
             yield _state(current_file="Completed", done=True)
 
     def _resolve_staging_dir(self) -> Path:
