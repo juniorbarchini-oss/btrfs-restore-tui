@@ -86,6 +86,33 @@ class TestPerFileErrors(Base):
         self.assertEqual(final.processed_files, 0)
 
 
+class TestEmptyDirs(Base):
+    def test_empty_subdirs_are_recreated(self):
+        tree = self.snap / "project"
+        (tree / "src").mkdir(parents=True)
+        (tree / "src" / "main.py").write_text("x")
+        (tree / "empty").mkdir()                       # empty
+        (tree / "nested" / "deeper").mkdir(parents=True)  # only empty subdirs
+        (tree / "logs").mkdir()
+
+        items = self.engine.prepare_items([tree], self.snap)
+        states = list(self.engine.restore_generator(
+            items, self.dest, ConflictResolution.OVERWRITE))
+        self.assertTrue(states[-1].done and not states[-1].error)
+
+        out = self.dest / "project"
+        self.assertTrue((out / "src" / "main.py").exists())
+        self.assertTrue((out / "empty").is_dir())
+        self.assertTrue((out / "nested" / "deeper").is_dir())
+        self.assertTrue((out / "logs").is_dir())
+
+    def test_selecting_a_single_empty_dir_restores_it(self):
+        (self.snap / "onlydir").mkdir()
+        items = self.engine.prepare_items([self.snap / "onlydir"], self.snap)
+        list(self.engine.restore_generator(items, self.dest, ConflictResolution.OVERWRITE))
+        self.assertTrue((self.dest / "onlydir").is_dir())
+
+
 class TestOwnership(Base):
     def test_within_user_home_detection(self):
         self.engine._user = "alice"

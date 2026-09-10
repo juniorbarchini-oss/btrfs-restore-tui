@@ -210,21 +210,35 @@ class RestoreEngine:
             return
 
         all_files_to_copy = []
+        dirs_to_make = []          # (src_dir, rel) - recreated even when empty
         for item in items:
             if item.is_dir:
-                for root, _, files in os.walk(item.source_path):
+                dirs_to_make.append((item.source_path, item.rel_path))
+                for root, subdirs, files in os.walk(item.source_path):
+                    try:
+                        base_rel = Path(root).relative_to(item.source_path)
+                    except ValueError:
+                        continue
+                    for d in subdirs:
+                        dirs_to_make.append((Path(root) / d, item.rel_path / base_rel / d))
                     for f in files:
-                        src_f = Path(root) / f
-                        try:
-                            rel_to_item = src_f.relative_to(item.source_path)
-                            all_files_to_copy.append((src_f, item.rel_path / rel_to_item))
-                        except ValueError:
-                            continue
+                        all_files_to_copy.append(
+                            (Path(root) / f, item.rel_path / base_rel / f))
             else:
                 all_files_to_copy.append((item.source_path, item.rel_path))
 
         total_files = len(all_files_to_copy)
         yield _state(current_file="Preparing...")
+
+        # -- recreate the directory tree first, so empty dirs survive a restore
+        #    and every level gets the right owner (not just each file's parent) --
+        for src_dir, rel in dirs_to_make:
+            dest_dir = target_base / rel
+            try:
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                self._apply_ownership(dest_dir, to_user=to_user, src=src_dir)
+            except OSError as exc:
+                errors.append(f"{rel}/: {exc.strerror or exc}")
 
         for src, rel in all_files_to_copy:
             dest = target_base / rel
