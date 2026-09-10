@@ -2,10 +2,11 @@
 btrfs_ops: argv-only command construction (no shell), progress plumbing.
 """
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
-from btrfs_restore.btrfs_ops import BtrfsOps, _human
+from btrfs_restore.btrfs_ops import BtrfsOps, _human, prune_paths
 
 
 class TestArgvSafety(unittest.TestCase):
@@ -40,6 +41,33 @@ class TestCountedPipe(unittest.TestCase):
         with open("/dev/null", "wb") as out:
             rc = ops._run_counted(["false"], ["cat"], out)
         self.assertNotEqual(rc, 0)
+
+
+class TestPrunePaths(unittest.TestCase):
+    def test_removes_matches_keeps_the_rest_and_skips_subvolumes(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "alice" / ".cache" / "x").mkdir(parents=True)
+            (root / "alice" / ".cache" / "x" / "blob").write_text("junk")
+            (root / "alice" / "Documents").mkdir(parents=True)
+            (root / "alice" / "Documents" / "keep.txt").write_text("keep")
+            (root / "var" / "log").mkdir(parents=True)          # nested subvol
+            (root / "var" / "tmp" / "j").mkdir(parents=True)
+
+            removed = prune_paths(
+                root, ["*/.cache", "var/tmp/*", "var/log"],
+                is_subvolume=lambda p: p.name == "log",
+            )
+            self.assertIn("alice/.cache", removed)
+            self.assertIn("var/tmp/j", removed)
+            self.assertNotIn("var/log", removed)                # subvolume left alone
+            self.assertFalse((root / "alice" / ".cache").exists())
+            self.assertTrue((root / "var" / "log").exists())
+            self.assertTrue((root / "alice" / "Documents" / "keep.txt").exists())
+
+    def test_missing_glob_is_a_noop(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(prune_paths(Path(d), ["nope/*", "*/.cache"]), [])
 
 
 class TestHuman(unittest.TestCase):

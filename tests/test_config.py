@@ -97,6 +97,28 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(cfg.snapshots_dir, Path("/mnt/x") / BACKUP_DIRNAME / "snapshots")
         self.assertEqual(cfg.latest_link, Path("/mnt/x") / BACKUP_DIRNAME / "latest")
 
+    def test_exclusions_defaults_and_extras(self):
+        self.cfg_file.write_text(
+            "EXCLUDE=Downloads/big/\n"
+            "EXCLUDE=*/node_modules\n"
+        )
+        cfg = Config.load()
+        self.assertTrue(cfg.exclude_defaults)
+        home_ex = cfg.exclusions_for("/home")
+        self.assertIn("*/.cache", home_ex)          # built-in
+        self.assertIn("Downloads/big/", home_ex)    # from file
+        self.assertIn("*/node_modules", home_ex)
+        root_ex = cfg.exclusions_for("/")
+        self.assertIn("var/tmp/*", root_ex)
+        self.assertIn("Downloads/big/", root_ex)    # extras apply to every mount
+
+    def test_exclude_defaults_off(self):
+        self.cfg_file.write_text("EXCLUDE_DEFAULTS=off\nEXCLUDE=*/.cache\n")
+        cfg = Config.load()
+        self.assertFalse(cfg.exclude_defaults)
+        self.assertEqual(cfg.exclusions_for("/home"), ["*/.cache"])
+        self.assertEqual(cfg.exclusions_for("/"), ["*/.cache"])
+
     def test_percent_clamped(self):
         self.cfg_file.write_text("MAX_DISK_PERCENT=5\n")
         self.assertEqual(Config.load().max_disk_percent, 10)  # floor

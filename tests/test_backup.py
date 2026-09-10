@@ -16,7 +16,7 @@ from unittest import mock
 from btrfs_restore import config as cfgmod
 from btrfs_restore.config import Config, BACKUP_DIRNAME
 from btrfs_restore.backup import BtrfsBackupEngine
-from btrfs_restore.btrfs_ops import CommandError
+from btrfs_restore.btrfs_ops import CommandError, prune_paths
 
 
 class FakeBtrfsOps:
@@ -32,8 +32,18 @@ class FakeBtrfsOps:
 
     def snapshot_ro(self, source: Path, dest: Path) -> None:
         dest.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source, dest, dirs_exist_ok=True)
         (dest / ".subvol_marker").write_text(str(source))
         self.subvolumes.add(str(dest))
+
+    def snapshot_rw(self, source: Path, dest: Path) -> None:
+        self.snapshot_ro(source, dest)
+
+    def set_readonly(self, path: Path, value: bool = True) -> None:
+        pass
+
+    def prune_paths(self, root: Path, patterns) -> list:
+        return prune_paths(Path(root), patterns, self.is_subvolume)
 
     def delete_subvolume(self, path: Path) -> None:
         self.subvolumes.discard(str(path))
@@ -314,6 +324,54 @@ class TestBackupRemote(BackupTestBase):
         r = BtrfsBackupEngine(cfg, ops=FakeBtrfsOps()).run()
         self.assertEqual(r.status, "failed")
         self.assertIn("target", r.message.lower())
+
+
+class TestBackupExclusions(BackupTestBase):
+    def _seed_caches(self):
+        # a user home with a fat cache + trash that must not be backed up
+        u = self.fake_home_src / "hbarchini"
+        (u / ".cache" / "mozilla").mkdir(parents=True)
+        (u / ".cache" / "mozilla" / "blob").write_bytes(b"x" * 4096)
+        (u / ".local" / "share" / "Trash" / "files").mkdir(parents=True)
+        (u / ".local" / "share" / "Trash" / "files" / "junk").write_text("junk")
+        (u / ".config" / "app").mkdir(parents=True)
+        (u / ".config" / "app" / "settings.json").write_text("{}")
+
+    def test_caches_are_left_out_and_recorded(self):
+        self._seed_caches()
+        cfg = self.make_cfg()
+        # engine derives kind from Path(mount).name -> "homefs" here
+        cfg.extra_exclusions = ["*/.cache", "*/.local/share/Trash"]
+        cfg.exclude_defaults = False
+        ops = FakeBtrfsOps(target_is_btrfs=True)
+        r = BtrfsBackupEngine(cfg, ops=ops).run()
+        self.assertEqual(r.status, "completed", r.message)
+
+        local_home = next(p for p in self.local_snaps.iterdir()
+                          if p.name.startswith("homefs_"))
+        self.assertFalse((local_home / "hbarchini" / ".cache").exists())
+        self.assertFalse((local_home / "hbarchini" / ".local" / "share" / "Trash").exists())
+        # real content survived
+        self.assertTrue((local_home / "hbarchini" / ".config" / "app" / "settings.json").exists())
+        self.assertTrue((local_home / "Documents" / "note.md").exists())
+
+        man = json.loads((cfg.snapshots_dir / r.snapshot_name / "manifest.json").read_text())
+        self.assertIn("homefs", man["excluded"])
+        self.assertIn("hbarchini/.cache", man["excluded"]["homefs"])
+
+    def test_no_exclusions_uses_plain_ro_snapshot(self):
+        self._seed_caches()
+        cfg = self.make_cfg()
+        cfg.exclude_defaults = False
+        cfg.extra_exclusions = []
+        ops = FakeBtrfsOps(target_is_btrfs=True)
+        r = BtrfsBackupEngine(cfg, ops=ops).run()
+        self.assertEqual(r.status, "completed", r.message)
+        local_home = next(p for p in self.local_snaps.iterdir()
+                          if p.name.startswith("homefs_"))
+        self.assertTrue((local_home / "hbarchini" / ".cache").exists())
+        man = json.loads((cfg.snapshots_dir / r.snapshot_name / "manifest.json").read_text())
+        self.assertEqual(man["excluded"], {})
 
 
 class TestBackupDryRun(BackupTestBase):

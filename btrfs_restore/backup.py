@@ -55,6 +55,7 @@ class BackupResult:
     duration_seconds: float = 0.0
     warnings: List[str] = field(default_factory=list)
     pruned: List[str] = field(default_factory=list)
+    excluded: Dict[str, List[str]] = field(default_factory=dict)
     message: str = ""
 
     @property
@@ -175,8 +176,13 @@ class BtrfsBackupEngine:
                 kind = "root" if mount == "/" else Path(mount).name
                 self._emit("stage", f"Snapshot {mount}")
                 local = self.cfg.local_snapshots_dir / f"{kind}_{compact}"
-                self._make_local_snapshot(Path(mount), local)
+                dropped = self._make_local_snapshot(
+                    Path(mount), local, self.cfg.exclusions_for(mount))
                 local_snaps[kind] = local.name
+                if dropped:
+                    result.excluded[kind] = dropped
+                    self._emit("info", f"{kind}: left out {len(dropped)} cache/trash "
+                                       f"path(s): {', '.join(dropped)}")
 
             # 2. system state (once)
             self._emit("stage", "System state (packages, config, restore.sh)")
@@ -261,6 +267,7 @@ class BtrfsBackupEngine:
                 created_at=datetime.now().isoformat(),
                 target_is_btrfs=bool(target_is_btrfs),
                 local_snapshots=local_snaps, parents=parents,
+                excluded=result.excluded,
                 warnings=result.warnings)
             self._update_latest(snap_dir)
             result.parents.update({f"usb/{k}": v for k, v in parents.items()})
@@ -365,13 +372,24 @@ class BtrfsBackupEngine:
 
     # -- steps -----------------------------------------------------
 
-    def _make_local_snapshot(self, mount: Path, dest: Path) -> None:
+    def _make_local_snapshot(self, mount: Path, dest: Path,
+                             exclusions: Optional[List[str]] = None) -> List[str]:
+        """RO snapshot of `mount` at `dest`. When `exclusions` are given the
+        snapshot is taken writable, the matching cache/trash paths are deleted,
+        and it is flipped read-only before it is used as a `send` source or an
+        incremental parent. Returns the paths actually removed."""
         if dest.exists():
             try:
                 self.ops.delete_subvolume(dest)
             except CommandError:
                 shutil.rmtree(dest, ignore_errors=True)
+        if exclusions:
+            self.ops.snapshot_rw(mount, dest)
+            dropped = self.ops.prune_paths(dest, exclusions)
+            self.ops.set_readonly(dest)
+            return dropped
         self.ops.snapshot_ro(mount, dest)
+        return []
 
     def _pick_parent(self, kind: str, prev_parents: Dict[str, str]) -> Optional[Path]:
         """The local snapshot recorded by the last completed backup for `kind`,
@@ -518,4 +536,8 @@ class BtrfsBackupEngine:
             self._emit("info", f"target: {t}")
         self._emit("info", f"sources: {' '.join(self.cfg.source_mounts)} "
                            "(incremental per target when a shared parent exists)")
+        for mount in self.cfg.source_mounts:
+            ex = self.cfg.exclusions_for(mount)
+            if ex:
+                self._emit("info", f"{mount}: would leave out {len(ex)} cache/trash glob(s)")
         return BackupResult("completed", snapshot_name=name, message="dry run finished")

@@ -36,6 +36,19 @@ MIN_KEEP=2
 # backup script's incremental chain is never broken.
 #LOCAL_KEEP=10
 
+# --- Exclusions (what to leave out of the backup) ---------------------
+# `btrfs send` can't skip paths mid-stream, so before sending, the engine takes
+# a WRITABLE snapshot of each subvolume, deletes the paths below, then flips it
+# read-only. These are throwaway caches / trash that only bloat the delta; apps
+# recreate them. A built-in list is always applied (var/tmp, crash/coredumps,
+# ~/.cache, ~/.local/share/Trash, browser + VSCode caches, ...):
+#   EXCLUDE_DEFAULTS=off        # drop the built-in list entirely
+# Add your own - one EXCLUDE line each, a glob relative to the subvolume root,
+# applied to every source mount (a glob that matches nothing is ignored):
+#EXCLUDE=*/node_modules
+#EXCLUDE=*/.cargo/registry/cache
+#EXCLUDE=Downloads/isos/
+
 # --- Remote SSH target ------------------------------------------------
 # Native btrfs replication over SSH. The remote user needs to be able to run
 # `btrfs receive` on REMOTE_PATH (either it owns the dir, or a sudoers line:

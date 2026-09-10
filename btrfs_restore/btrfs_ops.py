@@ -20,6 +20,35 @@ def _human(n: float) -> str:
         n /= 1024
 
 
+def prune_paths(root: Path, patterns: Sequence[str],
+                is_subvolume: Callable[[Path], bool] = lambda _p: False) -> List[str]:
+    """Delete every path under `root` that matches a glob in `patterns` (caches,
+    trash, crash dumps) so it never enters the `btrfs send` stream. A matched
+    path that is itself a nested subvolume is left alone - its data is not part
+    of this snapshot anyway. Returns the sorted removed paths, relative to root.
+    """
+    removed: List[str] = []
+    for pat in patterns:
+        for match in sorted(root.glob(pat)):
+            try:
+                rel = str(match.relative_to(root))
+            except ValueError:
+                continue
+            if not match.exists() and not match.is_symlink():
+                continue
+            try:
+                if match.is_symlink() or not match.is_dir():
+                    match.unlink()
+                elif is_subvolume(match):
+                    continue
+                else:
+                    shutil.rmtree(match)
+                removed.append(rel)
+            except OSError:
+                pass
+    return sorted(set(removed))
+
+
 def build_ssh_args(config, user: str) -> List[str]:
     """`ssh` + option flags as a list (never a shell string). Shared by the
     backup engine (remote target) and the restore engine (staging)."""
@@ -64,6 +93,18 @@ class BtrfsOps:
 
     def snapshot_ro(self, source: Path, dest: Path) -> None:
         self._run(["btrfs", "subvolume", "snapshot", "-r", str(source), str(dest)])
+
+    def snapshot_rw(self, source: Path, dest: Path) -> None:
+        """Writable snapshot - used when caches must be pruned before it is sent,
+        then flipped read-only with set_readonly()."""
+        self._run(["btrfs", "subvolume", "snapshot", str(source), str(dest)])
+
+    def set_readonly(self, path: Path, value: bool = True) -> None:
+        self._run(["btrfs", "property", "set", "-ts", str(path),
+                   "ro", "true" if value else "false"])
+
+    def prune_paths(self, root: Path, patterns: Sequence[str]) -> List[str]:
+        return prune_paths(root, patterns, self.is_subvolume)
 
     def delete_subvolume(self, path: Path) -> None:
         self._run(["btrfs", "subvolume", "delete", str(path)])
