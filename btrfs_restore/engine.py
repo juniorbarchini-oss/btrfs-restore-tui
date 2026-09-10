@@ -10,7 +10,7 @@ import subprocess
 from pathlib import Path
 from typing import Callable, Generator, List, Optional
 
-from .config import Config
+from .config import Config, _fstype_of
 from .models import ConflictResolution, RestoreItem, RestoreProgress, SnapshotInfo, SnapshotType
 
 logger = logging.getLogger("btrfs_restore")
@@ -318,6 +318,25 @@ class RestoreEngine:
         else:
             yield _state(current_file="Completed", done=True)
 
+    def _resolve_staging_dir(self) -> Path:
+        """A writable btrfs dir to `btrfs receive` into. Order: configured
+        STAGING_DIR, then /.snapshots/staging, then a dir at the top of /'s
+        subvolume. Raises a clear error if none of them is on btrfs."""
+        candidates: List[Path] = []
+        if self._config.staging_dir:
+            candidates.append(self._config.staging_dir)
+        candidates += [_DEFAULT_STAGING, Path("/.btrfs-restore-staging")]
+        for cand in candidates:
+            base = cand
+            while not base.exists() and base != base.parent:
+                base = base.parent
+            if _fstype_of(base) == "btrfs":
+                return cand
+        raise RuntimeError(
+            "No btrfs filesystem found for restore staging. Set STAGING_DIR in "
+            "~/.config/btrfs-restore/config.conf to a path on a btrfs mount "
+            "(the snapshot stream is received there before you browse it).")
+
     def _purge_staging_path(self, p: Path) -> None:
         """Delete a btrfs subvolume at `p`, or if `p` is a plain dir recurse into
         it (a `<pid>-<slug>/` run dir holds the received subvolume) and remove
@@ -397,6 +416,7 @@ class RestoreEngine:
         if snapshot.is_subvolume and snapshot.snap_type == SnapshotType.USB:
             return snapshot.path
 
+        self.staging_dir = self._resolve_staging_dir()   # validated btrfs target
         self.staging_dir.mkdir(parents=True, exist_ok=True)
         os.chmod(self.staging_dir, 0o755)
         self.cleanup_staging(orphans_only=True)   # clear dead runs, keep parallel ones
