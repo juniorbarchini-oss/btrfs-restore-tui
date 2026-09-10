@@ -79,10 +79,12 @@ class ConfirmRestoreModal(ModalScreen[Optional[ConflictResolution]]):
         Binding("o", "choose_overwrite", "Overwrite"),
     ]
 
-    def __init__(self, items: List[RestoreItem], target_path: Path):
+    def __init__(self, items: List[RestoreItem], target_path: Path,
+                 system_restore: bool = False):
         super().__init__()
         self.items = items
         self.target_path = target_path
+        self.system_restore = system_restore
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -105,6 +107,11 @@ class ConfirmRestoreModal(ModalScreen[Optional[ConflictResolution]]):
             with Vertical(id="modal-content"):
                 yield Label(f"Target: [bold yellow]{self.target_path}[/bold yellow]")
                 yield Label(f"Items to restore: [bold cyan]{len(self.items)}[/bold cyan] ({size_str})")
+                if self.system_restore:
+                    yield Label(
+                        "\n[bold red]SYSTEM restore[/bold red] - files keep their "
+                        "original owner (root). You may need to reload services "
+                        "or reboot afterwards.")
                 yield Label("\nIf files with matching names already exist:")
             with Horizontal(id="modal-buttons"):
                 yield Button("<B> Backup (.bak)", id="btn-bak", variant="primary")
@@ -204,17 +211,20 @@ class ProgressModal(ModalScreen[None]):
         current_file: str,
         done: bool = False,
         error: Optional[str] = None,
+        state=None,
     ):
+        # Once a terminal state (done / error) has been shown, ignore any
+        # trailing non-terminal updates so an error message can't be overwritten
+        # by a later spinner frame.
+        if self.is_done and not (done or error):
+            return
+
         spinner_lbl = self.query_one("#progress-spinner", Label)
         p_bar = self.query_one("#progress-bar", ProgressBar)
         file_lbl = self.query_one("#progress-filename", Label)
         btn_done = self.query_one("#btn-done", Button)
 
-        if error:
-            self.is_done = True
-            spinner_lbl.update("[bold red]❌ Error Encountered[/bold red]")
-            p_bar.progress = 0
-            file_lbl.update(f"[bold red]{error}[/bold red]")
+        def _finish():
             if self.can_cancel:
                 try:
                     self.query_one("#btn-cancel", Button).display = False
@@ -222,6 +232,31 @@ class ProgressModal(ModalScreen[None]):
                     pass
             btn_done.display = True
             btn_done.focus()
+
+        restored = getattr(state, "processed_files", None)
+        total = getattr(state, "total_files", None)
+        failed = getattr(state, "failed_files", 0)
+        fatal = getattr(state, "fatal", False)
+
+        if error and done and not fatal:
+            # some files went through, some failed - partial success
+            self.is_done = True
+            head = "[bold yellow]⚠  Restored with errors[/bold yellow]"
+            if restored is not None and total is not None:
+                head += f"  [dim]({restored}/{total} ok, {failed} failed)[/dim]"
+            spinner_lbl.update(head)
+            p_bar.progress = percent
+            file_lbl.update(f"[yellow]{error}[/yellow]")
+            _finish()
+            return
+
+        if error:
+            # fatal abort, or an error from a non-restore flow (deploy)
+            self.is_done = True
+            spinner_lbl.update("[bold red]❌ Error Encountered[/bold red]")
+            p_bar.progress = 0
+            file_lbl.update(f"[bold red]{error}[/bold red]")
+            _finish()
             return
 
         if done:
@@ -229,13 +264,7 @@ class ProgressModal(ModalScreen[None]):
             spinner_lbl.update("[bold yellow]✅ Operation completed successfully![/bold yellow]")
             p_bar.progress = 100
             file_lbl.update("All files restored and verified.")
-            if self.can_cancel:
-                try:
-                    self.query_one("#btn-cancel", Button).display = False
-                except Exception:
-                    pass
-            btn_done.display = True
-            btn_done.focus()
+            _finish()
             return
 
         spinner_char = SPINNER_FRAMES[spinner_idx % len(SPINNER_FRAMES)]
@@ -668,12 +697,15 @@ class BtrfsRestoreApp(App):
             target_base = Path(f"/home/{user}")
 
         items = self.engine.prepare_items(list(self.selected_paths), self.current_snapshot.path)
+        system_restore = not self.engine._within_user_home(target_base)
 
         def on_confirm(resolution: Optional[ConflictResolution]):
             if resolution:
                 self.run_restoration(items, target_base, resolution)
 
-        self.push_screen(ConfirmRestoreModal(items, target_base), on_confirm)
+        self.push_screen(
+            ConfirmRestoreModal(items, target_base, system_restore=system_restore),
+            on_confirm)
 
     def action_extract_custom(self) -> None:
         if not self.selected_paths:
@@ -707,6 +739,7 @@ class BtrfsRestoreApp(App):
                 state.current_file,
                 state.done,
                 state.error,
+                state,
             )
             import time
             time.sleep(0.03)

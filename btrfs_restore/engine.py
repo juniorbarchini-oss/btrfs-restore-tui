@@ -1,3 +1,4 @@
+import errno
 import logging
 import os
 import shutil
@@ -30,6 +31,8 @@ class RestoreEngine:
         else:
             self.target_uid = os.getuid()
             self.target_gid = os.getgid()
+
+        self._user = os.getenv("SUDO_USER") or os.getenv("USER") or getpass.getuser()
 
     def cancel_active_operation(self) -> None:
         """Cancel any running streaming process and purge staging subvolumes."""
@@ -87,11 +90,30 @@ class RestoreEngine:
                     "on local disk. This backup requires its base parent.")
             raise RuntimeError(msg)
 
-    def _ensure_ownership(self, path: Path):
-        """Ensure file or folder is owned by the real user instead of root."""
+    def _within_user_home(self, p: Path) -> bool:
+        """True when `p` is the invoking user's home or something under it."""
         try:
-            os.chown(path, self.target_uid, self.target_gid)
-        except (PermissionError, ProcessLookupError, OSError):
+            home = Path(f"/home/{self._user}")
+            p = Path(p).resolve() if p.exists() else Path(p)
+            return p == home or home in p.parents
+        except (OSError, ValueError):
+            return False
+
+    def _apply_ownership(self, path: Path, *, to_user: bool,
+                         src: Optional[Path] = None) -> None:
+        """Set ownership on a restored path.
+
+        Restoring into the user's home -> give it to the user (files copied as
+        root otherwise). Restoring to `/` or another system path -> keep the
+        owner recorded in the snapshot (`src`), so e.g. /etc/sudoers stays
+        root:root; if `src` is unknown, leave it as created (root)."""
+        try:
+            if to_user:
+                os.chown(path, self.target_uid, self.target_gid, follow_symlinks=False)
+            elif src is not None:
+                st = src.stat(follow_symlinks=False)
+                os.chown(path, st.st_uid, st.st_gid, follow_symlinks=False)
+        except (PermissionError, ProcessLookupError, OSError, FileNotFoundError):
             pass
 
     def prepare_items(self, selected_paths: List[Path], snapshot_root: Path) -> List[RestoreItem]:
@@ -138,14 +160,56 @@ class RestoreEngine:
         items: List[RestoreItem],
         target_base: Path,
         resolution: ConflictResolution = ConflictResolution.BACKUP,
+        preserve_system_ownership: Optional[bool] = None,
     ) -> Generator[RestoreProgress, None, None]:
         """
         Execute file restoration incrementally, yielding progress states
         to drive the ASCII spinner and progress bar.
-        """
-        total_bytes = sum(item.size_bytes for item in items)
-        all_files_to_copy = []
 
+        A per-file error (permission, a vanished source) is collected and the
+        run continues; the final state carries `done=True` together with an
+        `error` summary and `failed_files` - never a bare "completed". A fatal
+        error (target not writable, disk full) aborts at once with
+        `done=True, fatal=True`.
+
+        `preserve_system_ownership`: None -> decide from the target (user home =
+        chown to user, anywhere else = keep the snapshot's owner). True/False
+        forces it.
+        """
+        target_base = Path(target_base)
+        if preserve_system_ownership is None:
+            to_user = self._within_user_home(target_base)
+        else:
+            to_user = not preserve_system_ownership
+
+        total_bytes = sum(item.size_bytes for item in items)
+
+        def _state(**kw):
+            base = dict(total_files=total_files, processed_files=processed_files,
+                        total_bytes=total_bytes, processed_bytes=processed_bytes,
+                        current_file="", spinner_idx=spinner_frame,
+                        failed_files=len(errors), errors=list(errors))
+            base.update(kw)
+            return RestoreProgress(**base)
+
+        total_files = 0
+        processed_files = 0
+        processed_bytes = 0
+        spinner_frame = 0
+        errors: List[str] = []
+
+        # -- fatal preflight: is the target base usable at all? --
+        try:
+            target_base.mkdir(parents=True, exist_ok=True)
+            probe = target_base / ".btrfs-restore-write-test"
+            probe.write_text("ok")
+            probe.unlink()
+        except OSError as exc:
+            yield _state(current_file="", done=True, fatal=True,
+                         error=f"Cannot write to {target_base}: {exc}")
+            return
+
+        all_files_to_copy = []
         for item in items:
             if item.is_dir:
                 for root, _, files in os.walk(item.source_path):
@@ -153,67 +217,40 @@ class RestoreEngine:
                         src_f = Path(root) / f
                         try:
                             rel_to_item = src_f.relative_to(item.source_path)
-                            dest_rel = item.rel_path / rel_to_item
-                            all_files_to_copy.append((src_f, dest_rel))
-                        except Exception:
+                            all_files_to_copy.append((src_f, item.rel_path / rel_to_item))
+                        except ValueError:
                             continue
             else:
                 all_files_to_copy.append((item.source_path, item.rel_path))
 
         total_files = len(all_files_to_copy)
-        processed_files = 0
-        processed_bytes = 0
-        spinner_frame = 0
-
-        yield RestoreProgress(
-            total_files=total_files,
-            processed_files=0,
-            total_bytes=total_bytes,
-            processed_bytes=0,
-            current_file="Preparing...",
-            spinner_idx=0,
-        )
+        yield _state(current_file="Preparing...")
 
         for src, rel in all_files_to_copy:
             dest = target_base / rel
-
-            # Handle existing conflicts
-            if dest.exists() or dest.is_symlink():
-                if resolution == ConflictResolution.SKIP:
-                    processed_files += 1
-                    file_size = src.stat().st_size if src.exists() and not src.is_symlink() else 0
-                    processed_bytes += file_size
-                    continue
-                elif resolution == ConflictResolution.BACKUP:
-                    bak_path = self._get_backup_path(dest)
-                    try:
-                        shutil.move(dest, bak_path)
-                        self._ensure_ownership(bak_path)
-                    except Exception as e:
-                        yield RestoreProgress(
-                            total_files=total_files,
-                            processed_files=processed_files,
-                            total_bytes=total_bytes,
-                            processed_bytes=processed_bytes,
-                            current_file=rel.name,
-                            spinner_idx=spinner_frame,
-                            error=f"Backup failed: {e}",
-                        )
-                        continue
-                elif resolution == ConflictResolution.OVERWRITE:
-                    if dest.is_dir() and not dest.is_symlink():
-                        shutil.rmtree(dest, ignore_errors=True)
-                    else:
-                        try:
-                            dest.unlink()
-                        except Exception:
-                            pass
-
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            self._ensure_ownership(dest.parent)
-
             try:
-                # Copy file preserving permissions and timestamps
+                # -- existing-file conflict --
+                if dest.exists() or dest.is_symlink():
+                    if resolution == ConflictResolution.SKIP:
+                        processed_files += 1
+                        if src.exists() and not src.is_symlink():
+                            processed_bytes += src.stat().st_size
+                        continue
+                    if resolution == ConflictResolution.BACKUP:
+                        bak_path = self._get_backup_path(dest)
+                        shutil.move(str(dest), str(bak_path))
+                        if to_user:
+                            self._apply_ownership(bak_path, to_user=True)
+                    elif resolution == ConflictResolution.OVERWRITE:
+                        if dest.is_dir() and not dest.is_symlink():
+                            shutil.rmtree(dest, ignore_errors=True)
+                        else:
+                            dest.unlink()
+
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                self._apply_ownership(dest.parent, to_user=to_user, src=src.parent)
+
+                # -- copy --
                 if src.is_symlink():
                     link_target = os.readlink(src)
                     if dest.exists() or dest.is_symlink():
@@ -224,40 +261,33 @@ class RestoreEngine:
                     shutil.copy2(src, dest)
                     file_size = src.stat().st_size
 
-                self._ensure_ownership(dest)
+                self._apply_ownership(dest, to_user=to_user, src=src)
                 processed_bytes += file_size
                 processed_files += 1
                 spinner_frame = (spinner_frame + 1) % 4
+                yield _state(current_file=rel.name)
 
-                yield RestoreProgress(
-                    total_files=total_files,
-                    processed_files=processed_files,
-                    total_bytes=total_bytes,
-                    processed_bytes=processed_bytes,
-                    current_file=rel.name,
-                    spinner_idx=spinner_frame,
-                )
+            except OSError as exc:
+                if exc.errno == errno.ENOSPC:
+                    errors.append(f"{rel}: disk full")
+                    yield _state(current_file=rel.name, done=True, fatal=True,
+                                 error=f"Disk full while restoring {rel.name} - "
+                                       f"aborted with {processed_files}/{total_files} done")
+                    return
+                errors.append(f"{rel}: {exc.strerror or exc}")
+                yield _state(current_file=f"! {rel.name}")
+            except Exception as exc:  # noqa: BLE001 - report, don't crash the run
+                errors.append(f"{rel}: {exc}")
+                yield _state(current_file=f"! {rel.name}")
 
-            except Exception as e:
-                yield RestoreProgress(
-                    total_files=total_files,
-                    processed_files=processed_files,
-                    total_bytes=total_bytes,
-                    processed_bytes=processed_bytes,
-                    current_file=rel.name,
-                    spinner_idx=spinner_frame,
-                    error=str(e),
-                )
-
-        yield RestoreProgress(
-            total_files=total_files,
-            processed_files=processed_files,
-            total_bytes=total_bytes,
-            processed_bytes=processed_bytes,
-            current_file="Completed",
-            spinner_idx=spinner_frame,
-            done=True,
-        )
+        if errors:
+            shown = "\n".join(errors[:8])
+            if len(errors) > 8:
+                shown += f"\n... and {len(errors) - 8} more"
+            yield _state(current_file="Completed with errors", done=True,
+                         error=f"{len(errors)}/{total_files} file(s) failed:\n{shown}")
+        else:
+            yield _state(current_file="Completed", done=True)
 
     def cleanup_staging(self) -> None:
         """Delete temporary subvolumes in the staging dir."""
