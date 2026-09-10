@@ -831,8 +831,9 @@ The remote layout keeps each backup in three places:
        ./disaster-recovery.sh -- --root /mnt  # from a live ISO
 
    It pulls that snapshot's `_system_state/` + home subvolume into
-   `./btrfs-restore-recovery/<name>/` and runs its `restore.sh` (pacman config +
-   mirrors, explicit + AUR packages, Flatpaks, /etc bits, systemd units, home).
+   `/var/tmp/btrfs-restore-recovery/<name>/` (override with `BTRFS_RESTORE_WORK=`)
+   and runs its `restore.sh` (pacman config + mirrors, explicit + AUR packages,
+   Flatpaks, /etc bits, systemd units, home).
 
 4. Afterwards: check /etc/fstab and the bootloader config under
    `_system_state/bootloader/`, run `sudo mkinitcpio -P` if needed, reboot.
@@ -871,7 +872,9 @@ set -euo pipefail
 HOST="@@HOST@@"
 BASE="@@BASE@@"
 PORT="@@PORT@@"
-WORK="${PWD}/btrfs-restore-recovery"
+# staging lives outside any /home so restore.sh's final `chown -R /home/<user>`
+# never recurses into the read-only received subvolume we drop here.
+WORK="${BTRFS_RESTORE_WORK:-/var/tmp/btrfs-restore-recovery}"
 PICK=""
 
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10)
@@ -889,7 +892,9 @@ while [ $# -gt 0 ]; do
 done
 
 echo "Backup host : ${HOST}:${BASE}"
-mapfile -t NAMES < <(ssh "${SSH_OPTS[@]}" "${HOST}" "ls -1 ${BASE}/meta 2>/dev/null" | sort -r)
+# -n on every standalone ssh: without it ssh swallows this script's stdin and
+# the `read` prompts below get EOF. (rsync manages its own ssh, leave that one.)
+mapfile -t NAMES < <(ssh -n "${SSH_OPTS[@]}" "${HOST}" "ls -1 ${BASE}/meta 2>/dev/null" | sort -r)
 [ "${#NAMES[@]}" -gt 0 ] || { echo "no snapshots under ${HOST}:${BASE}/meta"; exit 1; }
 
 echo "Snapshots on the host (newest first):"
@@ -913,8 +918,8 @@ echo "[1/3] system state + restore.sh  ->  ${SNAP}"
 rsync -aAX -e "ssh ${SSH_OPTS[*]}" "${HOST}:${BASE}/meta/${PICK}/" "${SNAP}/"
 
 echo "[2/3] home subvolume"
-if ssh "${SSH_OPTS[@]}" "${HOST}" "sudo -n btrfs subvolume show ${BASE}/home/home_${COMPACT}" >/dev/null 2>&1; then
-    ssh "${SSH_OPTS[@]}" "${HOST}" "sudo btrfs send ${BASE}/home/home_${COMPACT}" \
+if ssh -n "${SSH_OPTS[@]}" "${HOST}" "sudo -n btrfs subvolume show ${BASE}/home/home_${COMPACT}" >/dev/null 2>&1; then
+    ssh -n "${SSH_OPTS[@]}" "${HOST}" "sudo btrfs send ${BASE}/home/home_${COMPACT}" \
         | sudo btrfs receive "${SNAP}/"
 else
     echo "  ! cannot read ${BASE}/home/home_${COMPACT} on ${HOST}"
