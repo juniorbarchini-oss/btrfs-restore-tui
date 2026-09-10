@@ -405,6 +405,24 @@ class TestBackupExclusions(BackupTestBase):
         self.assertEqual(man["excluded"], {})
 
 
+class TestRecoveryKit(BackupTestBase):
+    def test_completed_usb_backup_writes_the_recovery_kit(self):
+        cfg = self.make_cfg()
+        r = BtrfsBackupEngine(cfg, ops=FakeBtrfsOps(target_is_btrfs=True)).run()
+        self.assertEqual(r.status, "completed", r.message)
+        root = cfg.target_root
+        dr = root / "disaster-recovery.sh"
+        self.assertTrue(dr.is_file())
+        self.assertTrue(os.access(dr, os.X_OK))
+        recovery_md = (root / "RECOVERY.md").read_text()
+        self.assertIn("Disaster recovery", recovery_md)
+        self.assertIn(r.snapshot_name, recovery_md)
+        self.assertTrue((root / "btrfs-restore-tui-src.tar.gz").is_file())
+        # the script parses without a shell error
+        import subprocess as sp
+        self.assertEqual(sp.run(["bash", "-n", str(dr)]).returncode, 0)
+
+
 class TestBackupScratchCleanup(BackupTestBase):
     def test_run_leaves_no_scratch_dir_and_keeps_last_log(self):
         cfg = self.make_cfg()

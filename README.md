@@ -42,10 +42,13 @@ merge):
 │   ├── root_<ts>/  home_<ts>/   received subvolumes (btrfs target)
 │   ├── root.btrfs.zst  ...       compressed streams (non-btrfs target)
 │   ├── _system_state/            pacman/AUR/flatpak lists, disk layout, boot
-│   ├── restore.sh                self-contained bare-metal recovery
+│   ├── restore.sh                self-contained bare-metal recovery (one snapshot)
 │   ├── manifest.json             status: completed | partial | failed
 │   └── backup.log
-└── latest -> snapshots/<ts>      only ever points at a `completed` one
+├── latest -> snapshots/<ts>      only ever points at a `completed` one
+├── disaster-recovery.sh          pick a snapshot, run its restore.sh
+├── RECOVERY.md                   plain-language recovery instructions
+└── btrfs-restore-tui-src.tar.gz  the app, for an offline reinstall
 ```
 
 The SSH host receives native subvolumes under `<remote>/{root,home}/<name>` and
@@ -116,15 +119,22 @@ aborts at once.
 
 ## 4. Bare-metal recovery
 
-Every backup snapshot carries a self-contained `restore.sh` that needs only
-bash, coreutils, rsync, pacman and btrfs-progs — no Python, not this app. From a
-fresh Arch install / live ISO:
+Each backup writes a recovery kit at the **root of the backup folder** — no
+Python, no network, needs only bash, coreutils, rsync, pacman, btrfs-progs,
+zstd. From a fresh Arch install / live ISO:
 
 ```bash
-mount <drive>                       # or the SSH host
-cd <drive>/btrfs-restore/snapshots/<newest>
-sudo ./restore.sh                   # or: sudo ./restore.sh --root /mnt
+mount <drive>
+cd <drive>/btrfs-restore
+./disaster-recovery.sh              # lists snapshots, pick one, runs its restore.sh
+./disaster-recovery.sh --root /mnt  # from a live ISO, new root mounted at /mnt
 ```
+
+`disaster-recovery.sh` just drives the chosen snapshot's own `restore.sh`
+(`snapshots/<ts>/restore.sh`), which replays pacman config + mirrors, explicit
+and AUR packages, Flatpaks, `/etc` bits, systemd units and the home tree. Read
+`RECOVERY.md` for the full walkthrough. To recover only a few files, reinstall
+from `btrfs-restore-tui-src.tar.gz` and use `restore-now`.
 
 ---
 
