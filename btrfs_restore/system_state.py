@@ -254,6 +254,14 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# The home-tree step (rsync of root-owned files, chown -R) needs root. When we
+# are restoring the booted system (no --root) and were not started with sudo,
+# re-exec under sudo so [5/6] doesn't die on "Operation not permitted".
+if [ -z "${ROOT_PREFIX}" ] && [ "$(id -u)" -ne 0 ]; then
+    echo -e "${YELLOW}This recovery needs root - re-running with sudo...${NC}"
+    exec sudo -E "$0" "$@"
+fi
+
 TARGET_USER="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["user"])' "${STATE_DIR}/os_info.json" 2>/dev/null || echo "${SUDO_USER:-$USER}")"
 TARGET_HOME="${ROOT_PREFIX}/home/${TARGET_USER}"
 

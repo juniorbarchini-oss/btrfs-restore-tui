@@ -38,6 +38,13 @@ class TestSystemState(unittest.TestCase):
                             capture_output=True, text=True)
         self.assertEqual(rc.returncode, 0, rc.stderr)
 
+    def test_restore_script_self_elevates_for_the_home_step(self):
+        SystemStateCollector(self.snap).collect_all()
+        body = (self.snap / "restore.sh").read_text()
+        # not started with sudo + restoring the booted system -> re-exec as root
+        self.assertIn('[ "$(id -u)" -ne 0 ]', body)
+        self.assertIn("exec sudo -E", body)
+
     @unittest.skipUnless(shutil.which("shellcheck"), "shellcheck not installed")
     def test_restore_script_passes_shellcheck(self):
         SystemStateCollector(self.snap).collect_all()
