@@ -31,10 +31,16 @@ class SnapshotInfo:
     description: str = ""
     is_subvolume: bool = True
     size_bytes: Optional[int] = None
+    status: str = "completed"          # completed | partial | unknown
+    manifest: Optional[dict] = None    # the backup manifest.json, when present
 
     @property
     def formatted_time(self) -> str:
         return self.timestamp.strftime("%Y-%m-%d %H:%M:%S")
+
+    @property
+    def usable(self) -> bool:
+        return self.status in ("completed", "partial", "unknown")
 
 
 @dataclass
@@ -81,9 +87,14 @@ class RestoreProgress:
     spinner_idx: int = 0
     done: bool = False
     error: Optional[str] = None
+    failed_files: int = 0
+    errors: List[str] = field(default_factory=list)
+    fatal: bool = False          # aborted before finishing (vs. some files failed)
 
     @property
     def percent(self) -> int:
+        if self.done and not self.error:
+            return 100
         if self.total_bytes == 0:
             return 100 if self.done else 0
         return min(100, int((self.processed_bytes / self.total_bytes) * 100))

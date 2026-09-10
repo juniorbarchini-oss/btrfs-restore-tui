@@ -1,17 +1,60 @@
-# Btrfs Restore TUI - Example Configuration File
-# Copy this file to ~/.config/btrfs-restore/config.conf or /etc/btrfs-restore/config.conf
+# Btrfs Restore TUI - example configuration
+# Copy to  ~/.config/restore-tui/config.conf   (or ~/.config/btrfs-restore/config.conf,
+# or /etc/restore-tui/config.conf).  The program never rewrites or deletes this file.
+#
+# Every key can also be set as an environment variable with the RESTORE_TUI_ prefix
+# (e.g. RESTORE_TUI_TARGET_DIR). Env wins over the file. The old BTRFS_REMOTE_* names
+# still work but are deprecated.
 
-# Remote host IP or hostname (leave empty if only using Local / USB backups)
-BTRFS_REMOTE_HOST=192.168.1.100
+# --- Backup target (USB drive / directory) --------------------------------
+# Mount point of the drive to back up to. If unset, the tool auto-detects a
+# writable removable drive under /run/media/<user>/ or /media/<user>/, preferring
+# one that already holds a btrfs-restore backup, then one labelled USB_BTRFS.
+# A "btrfs-restore/" folder is created inside whatever is chosen.
+# For native btrfs send/receive the target must itself be a btrfs filesystem;
+# otherwise snapshots are stored as compressed .btrfs.zst streams.
+#TARGET_DIR=/run/media/hbarchini/USB_BTRFS
 
-# Remote backup storage directory
-BTRFS_REMOTE_PATH=/mnt/backups
+# --- Local snapshots -----------------------------------------------------
+# Where read-only local snapshots of / and /home are created and looked for.
+#LOCAL_SNAPSHOTS_DIR=/.snapshots
+# Directory used to stage (btrfs receive) a remote/stream snapshot for browsing.
+# Must be on a btrfs filesystem. Unset = the tool detects one.
+#STAGING_DIR=/.snapshots/staging
 
-# SSH user on the remote host (defaults to current user)
-BTRFS_REMOTE_USER=user
+# --- Retention ---------------------------------------------------------
+# Snapshots share disk via btrfs CoW, so many incrementals cost little. After a
+# successful backup the OLDEST completed snapshots are pruned until the drive is
+# back under MAX_DISK_PERCENT usage.
+MAX_DISK_PERCENT=80
+# ...but never below this many snapshots (safety floor).
+MIN_KEEP=2
+# Optional extra hard cap on the snapshot count (0 = disabled).
+#MAX_SNAPSHOTS=0
+# How many local RO snapshots to keep per kind (root/home). They only serve as
+# `btrfs send -p` parents for the next run. Kept generous so a co-existing
+# backup script's incremental chain is never broken.
+#LOCAL_KEEP=10
 
-# Human-readable display label for remote snapshots (e.g. "BackupServer", "NAS")
-BTRFS_REMOTE_NAME=BackupServer
+# --- Exclusions (what to leave out of the backup) ---------------------
+# `btrfs send` can't skip paths mid-stream, so before sending, the engine takes
+# a WRITABLE snapshot of each subvolume, deletes the paths below, then flips it
+# read-only. These are throwaway caches / trash that only bloat the delta; apps
+# recreate them. A built-in list is always applied (var/tmp, crash/coredumps,
+# ~/.cache, ~/.local/share/Trash, browser + VSCode caches, ...):
+#   EXCLUDE_DEFAULTS=off        # drop the built-in list entirely
+# Add your own - one EXCLUDE line each, a glob relative to the subvolume root,
+# applied to every source mount (a glob that matches nothing is ignored):
+#EXCLUDE=*/node_modules
+#EXCLUDE=*/.cargo/registry/cache
+#EXCLUDE=Downloads/isos/
 
-# SSH Port
-BTRFS_REMOTE_PORT=22
+# --- Remote SSH target ------------------------------------------------
+# Native btrfs replication over SSH. The remote user needs to be able to run
+# `btrfs receive` on REMOTE_PATH (either it owns the dir, or a sudoers line:
+#   <user> ALL=(root) NOPASSWD: /usr/bin/btrfs
+#REMOTE_HOST=100.81.31.97
+#REMOTE_PATH=/mnt/dellomar_backups
+#REMOTE_USER=hbarchini
+#REMOTE_PORT=22
+#REMOTE_NAME=i7server

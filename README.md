@@ -1,125 +1,214 @@
-# Btrfs Restore TUI (AGY Time Explorer) - v1.0
+# Btrfs Restore TUI (AGY Time Machine)
 
-> **A retro phosphor-green terminal UI for visual exploration and granular file/folder restoration from local and remote Btrfs snapshots.**
-> Optimized for **Omarchy Quattro / Arch Linux**, and compatible with modern Linux distributions using Btrfs (Fedora, openSUSE, Debian/Ubuntu).
+> **One terminal app for Btrfs backup *and* granular restore.** A retro
+> phosphor-green TUI to browse and recover individual files/folders from local,
+> USB and SSH snapshots, plus an incremental `btrfs send`-based backup engine.
+> Built for **Omarchy / Arch Linux**; works on any Btrfs-root distro.
 
----
-
-## 1. Overview and Purpose
-
-In Linux environments utilizing Btrfs file systems, system and user backups are efficiently performed via atomic read-only snapshots and compressed streams (`btrfs send | zstd`).
-
-While automated tools and scripts manage snapshot creation (such as `snapper` or custom backup scripts), recovering an individual deleted file or misplaced directory (e.g., an Obsidian note or a configuration file in `~/.config`) previously required tedious manual console commands (`btrfs receive`, mounting temporary subvolumes, `sudo` management, etc.).
-
-**Btrfs Restore TUI** solves this by delivering an interactive, lightweight, keyboard-driven terminal application that emulates the ease of **Apple Time Machine** with the classic aesthetics of vintage UNIX VT100 phosphor-green serial terminals.
+Status: **v1.0** released (restore only). `develop` carries **Phase A** — the
+backup engine and the unified launcher, reaching parity with the ext4 sibling
+[`restore-tui`](https://github.com/juniorbarchini-oss/restore-tui). Not yet
+tagged.
 
 ---
 
-## 2. Key Features
+## 1. What it does
 
-* **Visual Snapshot Browser:**
-  * **Local Snapshots:** Instant zero-latency browsing of local subvolumes (`/.snapshots/home_parent`, `root_parent`, and Snapper snapshots).
-  * **Remote Snapshots (SSH / NAS / Backup Server):** Automatically detects compressed `.btrfs.zst` backup streams and native remote subvolumes over SSH.
-  * **External Storage (USB Drives):** Automatically scans mounted USB drives (`/run/media/...`, `/media/...`, `/mnt/...`).
-  * **Ephemeral Staging:** Automatically streams and mounts remote snapshots into a temporary Btrfs staging subvolume (`/.snapshots/staging/`) in the background, cleaning up cleanly on exit.
-* **Retro Phosphor-Green Aesthetic:**
-  * Deep black background (`#000000`) with luminous green text and double borders (`#00FF66`).
-  * Marked items highlighted in vivid amber yellow (`#FFFF00`).
-  * Real-time operation feedback with vintage ASCII spinner (`[ | ]`, `[ / ]`, `[ - ]`, `[ \ ]`) and percentage meter `[ XX% ]`.
-* **Granular Keyboard Controls:**
-  * `↑` / `↓`: Navigate directories and files.
-  * `Enter`: Expand / Collapse directory nodes lazily.
-  * `Space`: Toggle file/folder selection `[ ]` ➔ `[X]` in bright amber.
-  * `a`: Select or deselect all items in the current folder.
-  * `r`: Restore selected items directly to their original system locations.
-  * `e`: Extract selected items to a custom directory (e.g., `~/recovered_...`).
-  * `s`: Switch active snapshot (Local, USB, or Remote backup host).
-  * `q`: Clean exit.
-* **Safety and Permission Integrity:**
-  * Conflict resolution dialogs: Backup existing files with `.bak` suffixes, overwrite, or cancel.
-  * Preserves original user ownership (`$SUDO_USER` / current user) even when running with elevated Btrfs capabilities.
+| Command | Purpose |
+|---|---|
+| `restore-tui` | Menu: **[B]** Backup now · **[R]** Restore files/folders · **[F]** Full recovery · **[Q]** Quit |
+| `backup-now` | Incremental Btrfs backup of `/` and `/home` to a USB drive and/or an SSH host |
+| `restore-now` | The retro TUI to browse a snapshot and restore/extract files |
+| `restore-tui --gc` | Remove staging / scratch left by a killed run; report freed space |
+| `restore-tui --paths` | Print every path the tool creates or touches |
+| `sudo ./uninstall.sh` | Remove everything (keeps your config and snapshots unless `--purge`) |
+
+Privilege is deferred: the menu runs unprivileged; picking Backup or Restore
+re-execs that one command under `sudo`.
 
 ---
 
-## 3. Keyboard Shortcuts Reference
+## 2. Backup engine (`backup-now`)
 
-| Key | Action | Description |
-|---|---|---|
-| `Space` | **Toggle Select** | Mark/unmark current file or directory `[X]` |
-| `Enter` | **Expand / Collapse** | Open or close directory node in tree |
-| `a` | **Select All** | Toggle selection for all items in active directory |
-| `r` | **Restore Original** | Restore selected files to original locations |
-| `e` | **Extract to...** | Extract to chosen directory with custom path modal |
-| `s` | **Switch Snapshot** | Open modal to select Local, USB, or Remote snapshot |
-| `Tab` | **Cycle Focus** | Move focus between file tree and action bar buttons |
-| `Esc` | **Cancel / Back** | Close active modal dialog |
-| `q` | **Quit** | Clean staging subvolumes and exit |
+Read-only local snapshots of each source subvolume, then `btrfs send [-p] | zstd`
+to the target(s) — incremental whenever a shared parent exists.
+
+**Layout written on the target** (same shape as the ext4 sibling, for a future
+merge):
+
+```
+<target>/btrfs-restore/
+├── snapshots/<YYYY-MM-DD_HHMMSS>/
+│   ├── root_<ts>/  home_<ts>/   received subvolumes (btrfs target)
+│   ├── root.btrfs.zst  ...       compressed streams (non-btrfs target)
+│   ├── _system_state/            pacman/AUR/flatpak lists, disk layout, boot
+│   ├── restore.sh                self-contained bare-metal recovery (one snapshot)
+│   ├── manifest.json             status: completed | partial | failed
+│   └── backup.log
+├── latest -> snapshots/<ts>      only ever points at a `completed` one
+├── disaster-recovery.sh          pick a snapshot, run its restore.sh
+├── RECOVERY.md                   plain-language recovery instructions
+└── btrfs-restore-tui-src.tar.gz  the app, for an offline reinstall
+```
+
+The SSH host receives native subvolumes under `<remote>/{root,home}/<name>` and
+the system state under `<remote>/meta/<name>/`.
+
+**Safety.** A run that cannot finish cleanly is marked `partial`/`failed`,
+`latest` is left untouched, and its snapshot is never used as an incremental
+parent. All transient state for a run lives under one pid-named dir
+(`/.snapshots/.backup-tmp/<pid>-<ts>/`), swept on the next start and on a
+`SIGTERM`; a hard kill leaves at most that one directory. A stalled SSH link
+times out instead of hanging the backup.
+
+**Exclusions.** `btrfs send` cannot skip paths mid-stream, so the engine takes a
+*writable* snapshot, deletes throwaway paths (caches, trash, crash dumps), then
+flips it read-only and sends that — the cleaned snapshot is also the incremental
+parent, so the churn never re-enters a later delta. A built-in list is always
+applied (`/var/tmp`, coredumps, `~/.cache`, `~/.local/share/Trash`, browser and
+Electron `*Cache` dirs, …). Add your own with `EXCLUDE=` lines in the config, or
+turn the built-in list off with `EXCLUDE_DEFAULTS=off`.
+
+**Retention.** After a successful backup the oldest `completed` snapshots on the
+target drive are pruned until it is back under `MAX_DISK_PERCENT` (default 80),
+never below `MIN_KEEP` (2), never the last. `MAX_SNAPSHOTS` is an optional hard
+cap. Local RO snapshots are kept `LOCAL_KEEP` deep (10) as `send -p` parents.
+
+Flags: `--dry-run`, `--target DIR`, `--keep N`, `--min-keep N`,
+`--max-disk-percent PCT`, `--quiet`.
 
 ---
 
-## 4. Architecture and Stack
+## 3. Restore TUI (`restore-now`)
 
-* **Language:** Python 3
-* **TUI Framework:** `Textual` (native async terminal UI with truecolor support)
-* **Backend:** Btrfs ioctl utilities, `zstd`, OpenSSH client
-* **Deployment Standard (Ecosystem Rule 7):**
-  * Binary & source location: `/opt/btrfs-restore-tui/`
-  * Global executable symlink: `/usr/local/bin/restore-now`
-  * Desktop application entry: `/usr/share/applications/btrfs-restore.desktop` (launches in `foot`)
+Browse a snapshot as a file tree and restore selected files/folders to their
+original location or extract them elsewhere.
+
+| Key | Action |
+|---|---|
+| `↑` `↓` | Navigate |
+| `Enter` | Expand / collapse a directory |
+| `Space` | Toggle selection `[ ]` ↔ `[X]` |
+| `a` | Select / deselect all in the current folder |
+| `r` | Restore selected items to their original path |
+| `e` | Extract selected items to a chosen directory |
+| `s` | Switch snapshot (Local / USB / Remote) |
+| `q` | Unmount / clean staging and quit |
+
+**Sources.** Local subvolumes and Snapper snapshots (instant), mounted USB
+drives, and an SSH host. A remote snapshot is first mounted **read-only over
+SSHFS** (`/.snapshots/.remote-mnt/<pid>-<slug>/`) so you can browse it and pull
+only the files you mark — nothing else crosses the network. If SSHFS is
+unavailable, or you need the whole subvolume back, it falls back to streaming it
+into a validated Btrfs staging subvolume (`/.snapshots/staging/<pid>-<slug>/`,
+or `STAGING_DIR`) with a live byte/rate readout. Both are cleaned up on exit and
+swept on the next start after a killed run.
+
+**Conflicts.** When a file already exists: `<B>` back it up as `.bak`, `<O>`
+overwrite, `<S>` skip existing, `<C>` cancel.
+
+**Ownership.** Restoring into your home → files are owned by you. Restoring to
+`/` or another system path → each file keeps the owner recorded in the snapshot
+(so `/etc/sudoers` stays `root:root`); the confirm dialog flags a system
+restore.
+
+**Errors are honest.** A per-file failure is collected and the run continues;
+the final state is *"Restored with errors (X/Y ok, Z failed)"* with the list —
+never a bare "completed". A fatal condition (unwritable target, disk full)
+aborts at once.
+
+**Empty directories** in a selection are recreated.
 
 ---
 
+## 4. Bare-metal recovery
+
+Each backup writes a recovery kit at the **root of the backup folder** — no
+Python, no network, needs only bash, coreutils, rsync, pacman, btrfs-progs,
+zstd. From a fresh Arch install / live ISO:
+
+```bash
+mount <drive>
+cd <drive>/btrfs-restore
+./disaster-recovery.sh              # lists snapshots, pick one, runs its restore.sh
+./disaster-recovery.sh --root /mnt  # from a live ISO, new root mounted at /mnt
+```
+
+`disaster-recovery.sh` just drives the chosen snapshot's own `restore.sh`
+(`snapshots/<ts>/restore.sh`), which replays pacman config + mirrors, explicit
+and AUR packages, Flatpaks, `/etc` bits, systemd units and the home tree. Read
+`RECOVERY.md` for the full walkthrough. To recover only a few files, reinstall
+from `btrfs-restore-tui-src.tar.gz` and use `restore-now`.
+
 ---
 
-## 5. Configuration (Optional Remote Server)
+## 5. Configuration
 
-By default, **Btrfs Restore TUI** immediately scans local snapshots and mounted USB drives without configuration.
-
-To enable remote SSH snapshot browsing, create a configuration file at `~/.config/btrfs-restore/config.conf` (or `/etc/btrfs-restore/config.conf`):
+No config needed for local + USB. For the SSH target/source, create
+`~/.config/btrfs-restore/config.conf` (see `config.conf.example`):
 
 ```conf
-# ~/.config/btrfs-restore/config.conf
-BTRFS_REMOTE_HOST=192.168.1.100
-BTRFS_REMOTE_PATH=/mnt/backups
-BTRFS_REMOTE_USER=user
-BTRFS_REMOTE_NAME=BackupServer
-BTRFS_REMOTE_PORT=22
+REMOTE_HOST=192.168.1.100
+REMOTE_PATH=/mnt/backups
+REMOTE_USER=user
+REMOTE_NAME=BackupServer
+REMOTE_PORT=22
+
+# STAGING_DIR=/.snapshots/staging      # must be on a btrfs mount
+# EXCLUDE=*/node_modules               # extra backup exclusions, one per line
+# EXCLUDE_DEFAULTS=off                 # drop the built-in exclusion list
+# MAX_DISK_PERCENT=80  MIN_KEEP=2  LOCAL_KEEP=10
 ```
 
-Alternatively, environment variables can be set (`BTRFS_REMOTE_HOST`, `BTRFS_REMOTE_PATH`, `BTRFS_REMOTE_USER`, `BTRFS_REMOTE_NAME`).
+Every key also works as an environment variable with the `RESTORE_TUI_` prefix
+(env wins). The old `BTRFS_REMOTE_*` names still work but are deprecated. The
+file is never rewritten by the program.
+
+**SSH host requirement.** The remote user must be able to run `btrfs` on
+`REMOTE_PATH`. Either it owns the directory, or add a sudoers line on the host:
+
+```
+<user> ALL=(root) NOPASSWD: /usr/bin/btrfs
+```
 
 ---
 
-## 6. Installation and Usage
+## 6. Install
 
-### Requirements
-* Arch Linux / Omarchy Quattro:
-  ```bash
-  sudo pacman -S python-textual btrfs-progs zstd openssh
-  ```
-* Debian / Ubuntu (Btrfs root):
-  ```bash
-  sudo apt install python3-textual btrfs-progs zstd openssh-client
-  ```
-* Fedora:
-  ```bash
-  sudo dnf install python3-textual btrfs-progs zstd openssh-clients
-  ```
-
-### Installation
-From the cloned repository:
 ```bash
-sudo ./install.sh
+# System tools the app shells out to (Python packages are NOT needed system-wide):
+sudo pacman -S btrfs-progs zstd pv openssh sshfs          # Arch / Omarchy
+# Debian/Ubuntu (btrfs root):  apt install btrfs-progs zstd pv openssh-client sshfs
+# Fedora:                      dnf install btrfs-progs zstd pv openssh-clients fuse-sshfs
+
+sudo ./install.sh          # -> /opt/btrfs-restore-tui, symlinks in /usr/local/bin, .desktop
 ```
 
-### Running
-From any terminal:
-```bash
-restore-now
-```
-Or launch **Btrfs Restore TUI** directly from your application launcher.
+`install.sh` builds a self-contained `/opt/btrfs-restore-tui/.venv` with
+`textual` + `rich` (falling back to system Python only if `venv` is
+unavailable), installs `sshfs` when missing, and retires a pre-existing loose
+`~/.local/bin/backup-now` (the AGY script this engine replaces) — archiving a
+copy to `~/.config/btrfs-restore/legacy-backup-now.sh.bak` and taking it off
+`PATH`.
+
+`sudo ./uninstall.sh` reverses it (`--yes` = app only, `--purge` = also config
+and the legacy script; snapshots always need a typed `DELETE`).
 
 ---
 
-## 7. License
-MIT License. Created for the AGY Ecosystem.
+## 7. Stack
+
+Python 3 · `textual` (TUI) · `rich` (backup dashboard), both in a bundled venv ·
+`btrfs-progs`, `zstd`, `pv`, OpenSSH, `sshfs` (optional, for lightweight remote
+browse). Deployed to `/opt/btrfs-restore-tui/`; commands
+`restore-tui` / `backup-now` / `restore-now` in `/usr/local/bin/`.
+
+**Tests.** `./run-tests.sh` (bootstraps `.venv` from `requirements-dev.txt`,
+runs `pytest`). `sudo ./run-tests.sh --e2e` adds the loop-device end-to-end
+test that exercises real `btrfs send`/`receive`.
+
+---
+
+## 8. License
+
+MIT. Part of the AGY ecosystem.

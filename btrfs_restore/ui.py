@@ -27,6 +27,12 @@ from .scanner import SnapshotScanner
 from .theme import RETRO_CSS, SPINNER_FRAMES
 
 
+def _unwind_on_signal(signum, _frame):
+    """Signal-safe: just raise. atexit + on_unmount do the staging cleanup;
+    calling subprocess or App.exit() from signal context can hang."""
+    raise SystemExit(128 + signum)
+
+
 class SnapshotSelectModal(ModalScreen[Optional[SnapshotInfo]]):
     """Retro modal to select which Btrfs snapshot to explore."""
 
@@ -77,12 +83,15 @@ class ConfirmRestoreModal(ModalScreen[Optional[ConflictResolution]]):
         Binding("escape", "cancel", "Cancel"),
         Binding("b", "choose_bak", "Backup (.bak)"),
         Binding("o", "choose_overwrite", "Overwrite"),
+        Binding("s", "choose_skip", "Skip existing"),
     ]
 
-    def __init__(self, items: List[RestoreItem], target_path: Path):
+    def __init__(self, items: List[RestoreItem], target_path: Path,
+                 system_restore: bool = False):
         super().__init__()
         self.items = items
         self.target_path = target_path
+        self.system_restore = system_restore
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -92,6 +101,9 @@ class ConfirmRestoreModal(ModalScreen[Optional[ConflictResolution]]):
 
     def action_choose_overwrite(self) -> None:
         self.dismiss(ConflictResolution.OVERWRITE)
+
+    def action_choose_skip(self) -> None:
+        self.dismiss(ConflictResolution.SKIP)
 
     def compose(self) -> ComposeResult:
         total_size = sum(i.size_bytes for i in self.items)
@@ -105,10 +117,16 @@ class ConfirmRestoreModal(ModalScreen[Optional[ConflictResolution]]):
             with Vertical(id="modal-content"):
                 yield Label(f"Target: [bold yellow]{self.target_path}[/bold yellow]")
                 yield Label(f"Items to restore: [bold cyan]{len(self.items)}[/bold cyan] ({size_str})")
+                if self.system_restore:
+                    yield Label(
+                        "\n[bold red]SYSTEM restore[/bold red] - files keep their "
+                        "original owner (root). You may need to reload services "
+                        "or reboot afterwards.")
                 yield Label("\nIf files with matching names already exist:")
             with Horizontal(id="modal-buttons"):
                 yield Button("<B> Backup (.bak)", id="btn-bak", variant="primary")
                 yield Button("<O> Overwrite", id="btn-overwrite", variant="warning")
+                yield Button("<S> Skip existing", id="btn-skip", variant="default")
                 yield Button("<C> Cancel (Esc)", id="btn-cancel", variant="default")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -116,6 +134,8 @@ class ConfirmRestoreModal(ModalScreen[Optional[ConflictResolution]]):
             self.dismiss(ConflictResolution.BACKUP)
         elif event.button.id == "btn-overwrite":
             self.dismiss(ConflictResolution.OVERWRITE)
+        elif event.button.id == "btn-skip":
+            self.dismiss(ConflictResolution.SKIP)
         else:
             self.dismiss(None)
 
@@ -204,17 +224,20 @@ class ProgressModal(ModalScreen[None]):
         current_file: str,
         done: bool = False,
         error: Optional[str] = None,
+        state=None,
     ):
+        # Once a terminal state (done / error) has been shown, ignore any
+        # trailing non-terminal updates so an error message can't be overwritten
+        # by a later spinner frame.
+        if self.is_done and not (done or error):
+            return
+
         spinner_lbl = self.query_one("#progress-spinner", Label)
         p_bar = self.query_one("#progress-bar", ProgressBar)
         file_lbl = self.query_one("#progress-filename", Label)
         btn_done = self.query_one("#btn-done", Button)
 
-        if error:
-            self.is_done = True
-            spinner_lbl.update("[bold red]❌ Error Encountered[/bold red]")
-            p_bar.progress = 0
-            file_lbl.update(f"[bold red]{error}[/bold red]")
+        def _finish():
             if self.can_cancel:
                 try:
                     self.query_one("#btn-cancel", Button).display = False
@@ -222,6 +245,31 @@ class ProgressModal(ModalScreen[None]):
                     pass
             btn_done.display = True
             btn_done.focus()
+
+        restored = getattr(state, "processed_files", None)
+        total = getattr(state, "total_files", None)
+        failed = getattr(state, "failed_files", 0)
+        fatal = getattr(state, "fatal", False)
+
+        if error and done and not fatal:
+            # some files went through, some failed - partial success
+            self.is_done = True
+            head = "[bold yellow]⚠  Restored with errors[/bold yellow]"
+            if restored is not None and total is not None:
+                head += f"  [dim]({restored}/{total} ok, {failed} failed)[/dim]"
+            spinner_lbl.update(head)
+            p_bar.progress = percent
+            file_lbl.update(f"[yellow]{error}[/yellow]")
+            _finish()
+            return
+
+        if error:
+            # fatal abort, or an error from a non-restore flow (deploy)
+            self.is_done = True
+            spinner_lbl.update("[bold red]❌ Error Encountered[/bold red]")
+            p_bar.progress = 0
+            file_lbl.update(f"[bold red]{error}[/bold red]")
+            _finish()
             return
 
         if done:
@@ -229,13 +277,7 @@ class ProgressModal(ModalScreen[None]):
             spinner_lbl.update("[bold yellow]✅ Operation completed successfully![/bold yellow]")
             p_bar.progress = 100
             file_lbl.update("All files restored and verified.")
-            if self.can_cancel:
-                try:
-                    self.query_one("#btn-cancel", Button).display = False
-                except Exception:
-                    pass
-            btn_done.display = True
-            btn_done.focus()
+            _finish()
             return
 
         spinner_char = SPINNER_FRAMES[spinner_idx % len(SPINNER_FRAMES)]
@@ -318,21 +360,34 @@ class BtrfsRestoreApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        # Register atexit and signal handlers for foolproof staging cleanup
-        atexit.register(self.engine.cleanup_staging)
+        # Foolproof staging cleanup: atexit + on_unmount handle it. The signal
+        # handlers only unwind (SystemExit) - which runs both - so nothing
+        # unsafe happens in signal context.
+        atexit.register(self.engine._cleanup_own_staging)
+        atexit.register(self.engine._cleanup_remote_mounts)
         try:
-            signal.signal(signal.SIGTERM, lambda s, f: (self.engine.cleanup_staging(), self.exit()))
-            signal.signal(signal.SIGHUP, lambda s, f: (self.engine.cleanup_staging(), self.exit()))
-        except Exception:
+            signal.signal(signal.SIGTERM, _unwind_on_signal)
+            signal.signal(signal.SIGHUP, _unwind_on_signal)
+        except (ValueError, OSError):
             pass
 
-        # Purge any leftover staging subvolume on startup
-        self.engine.cleanup_staging()
+        # Purge staging left by dead runs on startup (keep a parallel run's)
+        self.engine.cleanup_staging(orphans_only=True)
         self.refresh_snapshots()
 
     def refresh_snapshots(self) -> None:
-        # Load local and USB snapshots immediately (sub-millisecond latency)
-        self.snapshots = self.scanner.scan_local_snapshots() + self.scanner.scan_usb_snapshots()
+        # Manifest-based backup-now snapshots first, then legacy local/USB scans.
+        self.snapshots = (
+            self.scanner.scan_target_snapshots()
+            + self.scanner.scan_local_snapshots()
+            + self.scanner.scan_usb_snapshots()
+        )
+        seen, deduped = set(), []
+        for s in self.snapshots:
+            if s.id not in seen:
+                seen.add(s.id)
+                deduped.append(s)
+        self.snapshots = deduped
         if self.snapshots:
             self.current_snapshot = next(
                 (s for s in self.snapshots if "home" in s.id.lower()),
@@ -347,26 +402,50 @@ class BtrfsRestoreApp(App):
 
     @work(thread=True)
     def scan_remote_background(self) -> None:
-        """Scan remote server asynchronously in background thread."""
+        """Scan remote server asynchronously in background thread, and always
+        report the outcome so a silent 'nothing new' isn't mistaken for
+        'never connected'."""
+        name = self.scanner.config.remote_name or "Remote"
         try:
             remote_snaps = self.scanner.scan_remote_snapshots()
-            if remote_snaps:
-                remote_name = self.scanner.config.remote_name or "Remote"
-                existing_ids = {s.id for s in self.snapshots}
-                added = 0
-                for r in remote_snaps:
-                    if r.id not in existing_ids:
-                        self.snapshots.append(r)
-                        added += 1
-                if added > 0:
-                    self.snapshots.sort(key=lambda s: s.timestamp, reverse=True)
-                    self.app.call_from_thread(
-                        self.notify,
-                        f"📡 Connected to {remote_name}: {len(remote_snaps)} remote snapshots available",
-                        severity="information",
-                    )
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            self.app.call_from_thread(self.notify, f"⚠️ {name}: {exc}", severity="warning")
+            return
+
+        status = getattr(self.scanner, "remote_status", "none")
+        skipped = getattr(self.scanner, "remote_skipped_local", 0)
+
+        if status == "none":
+            return  # no remote configured - stay quiet
+        if status == "unreachable":
+            self.app.call_from_thread(
+                self.notify, f"⚠️ {name} not responding (check network / SSH / config)",
+                severity="warning")
+            return
+        if status == "no_privilege":
+            self.app.call_from_thread(
+                self.notify,
+                f"⚠️ {name} connected, but 'sudo btrfs' is not allowed there - "
+                "listing what's readable without root only",
+                severity="warning")
+
+        existing = {s.id for s in self.snapshots}
+        added = [r for r in remote_snaps if r.id not in existing]
+        if added:
+            self.snapshots.extend(added)
+            self.snapshots.sort(key=lambda s: s.timestamp, reverse=True)
+            self.app.call_from_thread(
+                self.notify, f"📡 {name}: {len(added)} snapshot(s) only on the remote",
+                severity="information")
+        elif skipped:
+            self.app.call_from_thread(
+                self.notify,
+                f"📡 {name} connected — its {skipped} snapshot(s) are already local",
+                severity="information")
+        else:
+            self.app.call_from_thread(
+                self.notify, f"📡 {name} connected — no snapshots",
+                severity="information")
 
     def load_snapshot_tree(self) -> None:
         if not self.current_snapshot:
@@ -549,7 +628,16 @@ class BtrfsRestoreApp(App):
 
     @work(thread=True)
     def deploy_and_switch(self, snapshot: SnapshotInfo) -> None:
-        """Deploy remote or USB snapshot stream in background with progress modal."""
+        """Make a remote / USB-stream snapshot browsable.
+
+        For a remote subvolume we first try a read-only SSHFS mount: nothing is
+        transferred up front and only the files the user marks are pulled across
+        on restore. If SSHFS is unavailable or the mount fails, fall back to
+        streaming the whole subvolume into staging with a live byte/rate readout.
+        """
+        import time
+        import threading
+
         cancelled = False
         done_flag = False
 
@@ -567,62 +655,68 @@ class BtrfsRestoreApp(App):
         )
         self.app.call_from_thread(self.push_screen, progress_modal)
 
-        # Active spinner while streaming
+        def finish_ok(path, message):
+            snapshot.path = path
+            snapshot.is_subvolume = True
+            self.current_snapshot = snapshot
+            self.app.call_from_thread(
+                progress_modal.update_progress, 0, 100, message, done=True)
+            time.sleep(0.4)
+            self.app.call_from_thread(progress_modal.dismiss, None)
+            self.app.call_from_thread(self.load_snapshot_tree)
+            self.notify(f"Loaded snapshot: {snapshot.name}", severity="information")
+
+        # 1. Lightweight path: read-only SSHFS mount (no bulk transfer).
+        try:
+            mnt = self.engine.mount_remote_snapshot(snapshot)
+        except Exception:
+            mnt = None
+        if cancelled:
+            return
+        if mnt is not None:
+            finish_ok(mnt, f"Mounted read-only at {mnt} - marked files copy on restore")
+            return
+
+        # 2. Fallback: stream the whole subvolume into staging, with progress.
         spinner_idx = 0
+        have_bytes = False
+
+        def prog(text: str):
+            nonlocal spinner_idx, have_bytes
+            have_bytes = True
+            spinner_idx = (spinner_idx + 1) % 4
+            self.app.call_from_thread(
+                progress_modal.update_progress, spinner_idx, 50, f"Receiving  {text}")
 
         def spin_worker():
+            # Keep the spinner alive until pv starts reporting bytes (or there is
+            # no pv, in which case this is the only progress the user sees).
             nonlocal spinner_idx
             while not done_flag:
-                spinner_idx = (spinner_idx + 1) % 4
-                self.app.call_from_thread(
-                    progress_modal.update_progress,
-                    spinner_idx,
-                    50,
-                    "Receiving Btrfs stream into /.snapshots/staging...",
-                )
-                import time
-                time.sleep(0.15)
+                if not have_bytes:
+                    spinner_idx = (spinner_idx + 1) % 4
+                    self.app.call_from_thread(
+                        progress_modal.update_progress, spinner_idx, 50,
+                        "Receiving Btrfs stream into staging...")
+                time.sleep(0.2)
 
-        import threading
         t = threading.Thread(target=spin_worker, daemon=True)
         t.start()
 
         try:
-            staging_path = self.engine.deploy_staging(snapshot)
+            staging_path = self.engine.deploy_staging(snapshot, progress_cb=prog)
             if cancelled:
                 return
-
             done_flag = True
             t.join(timeout=0.5)
-
-            snapshot.path = staging_path
-            snapshot.is_subvolume = True
-            self.current_snapshot = snapshot
-
-            self.app.call_from_thread(
-                progress_modal.update_progress,
-                0,
-                100,
-                f"Mounted at {staging_path}",
-                done=True,
-            )
-            import time
-            time.sleep(0.5)
-            self.app.call_from_thread(progress_modal.dismiss, None)
-            self.app.call_from_thread(self.load_snapshot_tree)
-            self.notify(f"Loaded snapshot: {snapshot.name}", severity="information")
+            finish_ok(staging_path, f"Mounted at {staging_path}")
         except Exception as e:
             if cancelled:
                 return
             done_flag = True
             t.join(timeout=0.5)
             self.app.call_from_thread(
-                progress_modal.update_progress,
-                0,
-                0,
-                "",
-                error=str(e),
-            )
+                progress_modal.update_progress, 0, 0, "", error=str(e))
 
     def action_restore_original(self) -> None:
         if not self.selected_paths:
@@ -640,12 +734,15 @@ class BtrfsRestoreApp(App):
             target_base = Path(f"/home/{user}")
 
         items = self.engine.prepare_items(list(self.selected_paths), self.current_snapshot.path)
+        system_restore = not self.engine._within_user_home(target_base)
 
         def on_confirm(resolution: Optional[ConflictResolution]):
             if resolution:
                 self.run_restoration(items, target_base, resolution)
 
-        self.push_screen(ConfirmRestoreModal(items, target_base), on_confirm)
+        self.push_screen(
+            ConfirmRestoreModal(items, target_base, system_restore=system_restore),
+            on_confirm)
 
     def action_extract_custom(self) -> None:
         if not self.selected_paths:
@@ -679,6 +776,7 @@ class BtrfsRestoreApp(App):
                 state.current_file,
                 state.done,
                 state.error,
+                state,
             )
             import time
             time.sleep(0.03)
@@ -702,9 +800,13 @@ class BtrfsRestoreApp(App):
             self.action_quit_app()
 
     def on_unmount(self) -> None:
-        """Cleanup staging subvolume on exit."""
+        """Cleanup this run's staging subvolume and remote mount on exit."""
         try:
-            self.engine.cleanup_staging()
+            self.engine._cleanup_own_staging()
+        except Exception:
+            pass
+        try:
+            self.engine._cleanup_remote_mounts()
         except Exception:
             pass
 
