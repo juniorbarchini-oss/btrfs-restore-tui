@@ -46,6 +46,13 @@ echo "=== Uninstalling ${APP_NAME} ==="
 if [ -x /usr/local/bin/restore-tui ]; then
     /usr/local/bin/restore-tui --gc || true
 fi
+for d in "${SNAP_DIR}"/.remote-mnt/*; do
+    [ -e "$d" ] || continue
+    fusermount3 -uz "$d" 2>/dev/null || fusermount -uz "$d" 2>/dev/null \
+        || umount -l "$d" 2>/dev/null || true
+    rmdir "$d" 2>/dev/null || true
+done
+rmdir "${SNAP_DIR}/.remote-mnt" 2>/dev/null || true
 for d in "${SNAP_DIR}"/staging/* "${SNAP_DIR}"/.backup-tmp/*; do
     [ -e "$d" ] || continue
     btrfs subvolume delete "$d" 2>/dev/null || rm -rf "$d"

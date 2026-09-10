@@ -364,6 +364,7 @@ class BtrfsRestoreApp(App):
         # handlers only unwind (SystemExit) - which runs both - so nothing
         # unsafe happens in signal context.
         atexit.register(self.engine._cleanup_own_staging)
+        atexit.register(self.engine._cleanup_remote_mounts)
         try:
             signal.signal(signal.SIGTERM, _unwind_on_signal)
             signal.signal(signal.SIGHUP, _unwind_on_signal)
@@ -627,7 +628,16 @@ class BtrfsRestoreApp(App):
 
     @work(thread=True)
     def deploy_and_switch(self, snapshot: SnapshotInfo) -> None:
-        """Deploy remote or USB snapshot stream in background with progress modal."""
+        """Make a remote / USB-stream snapshot browsable.
+
+        For a remote subvolume we first try a read-only SSHFS mount: nothing is
+        transferred up front and only the files the user marks are pulled across
+        on restore. If SSHFS is unavailable or the mount fails, fall back to
+        streaming the whole subvolume into staging with a live byte/rate readout.
+        """
+        import time
+        import threading
+
         cancelled = False
         done_flag = False
 
@@ -645,62 +655,68 @@ class BtrfsRestoreApp(App):
         )
         self.app.call_from_thread(self.push_screen, progress_modal)
 
-        # Active spinner while streaming
+        def finish_ok(path, message):
+            snapshot.path = path
+            snapshot.is_subvolume = True
+            self.current_snapshot = snapshot
+            self.app.call_from_thread(
+                progress_modal.update_progress, 0, 100, message, done=True)
+            time.sleep(0.4)
+            self.app.call_from_thread(progress_modal.dismiss, None)
+            self.app.call_from_thread(self.load_snapshot_tree)
+            self.notify(f"Loaded snapshot: {snapshot.name}", severity="information")
+
+        # 1. Lightweight path: read-only SSHFS mount (no bulk transfer).
+        try:
+            mnt = self.engine.mount_remote_snapshot(snapshot)
+        except Exception:
+            mnt = None
+        if cancelled:
+            return
+        if mnt is not None:
+            finish_ok(mnt, f"Mounted read-only at {mnt} - marked files copy on restore")
+            return
+
+        # 2. Fallback: stream the whole subvolume into staging, with progress.
         spinner_idx = 0
+        have_bytes = False
+
+        def prog(text: str):
+            nonlocal spinner_idx, have_bytes
+            have_bytes = True
+            spinner_idx = (spinner_idx + 1) % 4
+            self.app.call_from_thread(
+                progress_modal.update_progress, spinner_idx, 50, f"Receiving  {text}")
 
         def spin_worker():
+            # Keep the spinner alive until pv starts reporting bytes (or there is
+            # no pv, in which case this is the only progress the user sees).
             nonlocal spinner_idx
             while not done_flag:
-                spinner_idx = (spinner_idx + 1) % 4
-                self.app.call_from_thread(
-                    progress_modal.update_progress,
-                    spinner_idx,
-                    50,
-                    "Receiving Btrfs stream into /.snapshots/staging...",
-                )
-                import time
-                time.sleep(0.15)
+                if not have_bytes:
+                    spinner_idx = (spinner_idx + 1) % 4
+                    self.app.call_from_thread(
+                        progress_modal.update_progress, spinner_idx, 50,
+                        "Receiving Btrfs stream into staging...")
+                time.sleep(0.2)
 
-        import threading
         t = threading.Thread(target=spin_worker, daemon=True)
         t.start()
 
         try:
-            staging_path = self.engine.deploy_staging(snapshot)
+            staging_path = self.engine.deploy_staging(snapshot, progress_cb=prog)
             if cancelled:
                 return
-
             done_flag = True
             t.join(timeout=0.5)
-
-            snapshot.path = staging_path
-            snapshot.is_subvolume = True
-            self.current_snapshot = snapshot
-
-            self.app.call_from_thread(
-                progress_modal.update_progress,
-                0,
-                100,
-                f"Mounted at {staging_path}",
-                done=True,
-            )
-            import time
-            time.sleep(0.5)
-            self.app.call_from_thread(progress_modal.dismiss, None)
-            self.app.call_from_thread(self.load_snapshot_tree)
-            self.notify(f"Loaded snapshot: {snapshot.name}", severity="information")
+            finish_ok(staging_path, f"Mounted at {staging_path}")
         except Exception as e:
             if cancelled:
                 return
             done_flag = True
             t.join(timeout=0.5)
             self.app.call_from_thread(
-                progress_modal.update_progress,
-                0,
-                0,
-                "",
-                error=str(e),
-            )
+                progress_modal.update_progress, 0, 0, "", error=str(e))
 
     def action_restore_original(self) -> None:
         if not self.selected_paths:
@@ -784,9 +800,13 @@ class BtrfsRestoreApp(App):
             self.action_quit_app()
 
     def on_unmount(self) -> None:
-        """Cleanup this run's staging subvolume on exit."""
+        """Cleanup this run's staging subvolume and remote mount on exit."""
         try:
             self.engine._cleanup_own_staging()
+        except Exception:
+            pass
+        try:
+            self.engine._cleanup_remote_mounts()
         except Exception:
             pass
 

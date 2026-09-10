@@ -7,6 +7,7 @@ import shutil
 import signal
 import getpass
 import subprocess
+import threading
 from pathlib import Path
 from typing import Callable, Generator, List, Optional
 
@@ -16,8 +17,16 @@ from .models import ConflictResolution, RestoreItem, RestoreProgress, SnapshotIn
 logger = logging.getLogger("btrfs_restore")
 
 _DEFAULT_STAGING = Path("/.snapshots/staging")
+# read-only SSHFS mounts of remote snapshots live here (sibling of staging), one
+# "<pid>-<slug>/" dir per run, lazy-unmounted + removed on start / cancel / exit.
+_REMOTE_MNT_DIRNAME = ".remote-mnt"
 # staging run dir name: "<pid>-<slug>"
 _STAGING_RUN_RE = re.compile(r"^(\d+)-")
+
+# pv between the producer and `btrfs receive` gives a live byte counter + rate +
+# elapsed even though `btrfs send` reports nothing itself. `-f` forces output
+# off a tty; the stream has no known total size so pv cannot show an ETA.
+_PV_ARGS = ["pv", "-f", "-b", "-t", "-r", "-i", "1"]
 
 
 def _pid_alive(pid: int) -> bool:
@@ -41,8 +50,10 @@ _RSYNC_FMT = f">>%i{_RSYNC_SEP}%l{_RSYNC_SEP}%n"
 
 
 class RestoreEngine:
-    def __init__(self):
+    def __init__(self, progress_cb: Optional[Callable[[str], None]] = None):
         self._active_procs: List[subprocess.Popen] = []
+        self._progress_cb = progress_cb
+        self._remote_mounts: List[Path] = []
         self._config = Config.load()
         self.staging_dir = self._config.staging_dir or _DEFAULT_STAGING
         # Determine real user UID and GID (when running under sudo)
@@ -60,9 +71,11 @@ class RestoreEngine:
         self._staging_run: Optional[Path] = None
 
     def cancel_active_operation(self) -> None:
-        """Cancel any running streaming process and purge this run's staging."""
+        """Cancel any running streaming process and purge this run's staging /
+        remote mount."""
         self._kill_active_procs()
         self._cleanup_own_staging()
+        self._cleanup_remote_mounts()
 
     def _kill_active_procs(self) -> None:
         """SIGTERM every stage's process group, then SIGKILL whatever is still
@@ -87,10 +100,42 @@ class RestoreEngine:
                     pass
         self._active_procs = []
 
-    def _run_pipeline(self, stages: List[List[str]]) -> None:
+    def _maybe_pv(self, stages: List[List[str]]) -> tuple:
+        """Splice a `pv` stage before the final `btrfs receive` when a progress
+        callback is set and `pv` is on PATH. Returns (stages, pv_index) where
+        pv_index is -1 when nothing was spliced."""
+        if self._progress_cb and shutil.which("pv") and len(stages) >= 2:
+            spliced = [*stages[:-1], list(_PV_ARGS), stages[-1]]
+            return spliced, len(spliced) - 2
+        return list(stages), -1
+
+    def _pump_pv(self, proc: subprocess.Popen) -> None:
+        """Feed pv's \\r-delimited stderr lines to the progress callback."""
+        buf = b""
+        try:
+            while True:
+                chunk = proc.stderr.read(64)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\r" in buf:
+                    line, buf = buf.split(b"\r", 1)
+                    text = line.decode("utf-8", "replace").strip()
+                    if text and self._progress_cb:
+                        self._progress_cb(text)
+        except (OSError, ValueError):
+            pass
+
+    def _run_pipeline(self, stages: List[List[str]], *, progress: bool = False) -> None:
         """Run `stages[0] | stages[1] | ...` with argv lists (never a shell).
         Each process gets its own session so cancel can killpg the whole tree
-        (including a remote ssh). Raises RuntimeError with stderr on failure."""
+        (including a remote ssh). Raises RuntimeError with stderr on failure.
+        With `progress=True` a `pv` stage is spliced in (when available) and its
+        byte/rate counter is streamed to the progress callback."""
+        pv_index = -1
+        if progress:
+            stages, pv_index = self._maybe_pv(stages)
+
         procs: List[subprocess.Popen] = []
         prev_stdout = None
         try:
@@ -112,9 +157,18 @@ class RestoreEngine:
             raise RuntimeError(f"missing command: {exc}") from exc
 
         self._active_procs = procs
+        pv_proc = procs[pv_index] if pv_index >= 0 else None
+        pump: Optional[threading.Thread] = None
+        if pv_proc is not None:
+            pump = threading.Thread(target=self._pump_pv, args=(pv_proc,), daemon=True)
+            pump.start()
+
         errs = []
         try:
             for p in procs:
+                if p is pv_proc:
+                    p.wait()            # its stderr is drained by the pump thread
+                    continue
                 _, err = p.communicate()
                 if err:
                     errs.append(err.decode("utf-8", "replace").strip())
@@ -122,10 +176,15 @@ class RestoreEngine:
             # Ctrl-C / SIGTERM mid-stream: the stages are in their own sessions
             # and never saw the terminal's SIGINT - kill them here.
             self._kill_active_procs()
+            if pump is not None:
+                pump.join(timeout=1.0)
             raise
+        if pump is not None:
+            pump.join(timeout=1.0)
         self._active_procs = []
 
-        failed = next((p for p in procs if p.returncode not in (0, None)), None)
+        failed = next((p for p in procs
+                       if p is not pv_proc and p.returncode not in (0, None)), None)
         if failed is not None:
             msg = " | ".join(e for e in errs if e) or "stream failed"
             low = msg.lower()
@@ -496,6 +555,8 @@ class RestoreEngine:
     def cleanup_staging(self, *, orphans_only: bool = False) -> None:
         """Purge staging run dirs. `orphans_only` keeps dirs whose pid is still
         running (a parallel backup/restore) - used on startup."""
+        if orphans_only:
+            self._sweep_orphan_mounts()
         if not self.staging_dir.exists():
             return
         for entry in self.staging_dir.iterdir():
@@ -510,6 +571,126 @@ class RestoreEngine:
         if run is not None and run.exists():
             self._purge_staging_path(run)
         self._staging_run = None
+
+    # -- lightweight remote browse: read-only SSHFS mount ------------------
+    #
+    # Restoring a note or a config from i7server should not stream the whole
+    # ~30 GB subvolume. We mount the remote snapshot read-only over SSHFS and
+    # let the restore engine read only the files the user actually marked
+    # (rsync / copy pull them across on demand). deploy_staging()'s full
+    # `btrfs send` stream stays as the fallback for "I lost the whole home".
+
+    def _remote_mnt_base(self) -> Path:
+        stg = self._config.staging_dir or _DEFAULT_STAGING
+        return stg.parent / _REMOTE_MNT_DIRNAME
+
+    def _sshfs_argv(self, snapshot: SnapshotInfo, config: Config,
+                    user: str, mountpoint: Path) -> List[str]:
+        """`sshfs <ruser>@<host>:<path> <mnt>` + options, all as argv elements -
+        the remote path is never spliced into a shell string."""
+        remote_user = config.remote_user or user
+        src = f"{remote_user}@{config.remote_host}:{snapshot.path}"
+        argv = ["sshfs", src, str(mountpoint),
+                "-o", "ro",
+                "-o", "reconnect",
+                "-o", "ConnectTimeout=10",
+                "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "BatchMode=yes",
+                "-o", "compression=yes"]
+        if config.remote_port and config.remote_port != 22:
+            argv += ["-p", str(config.remote_port)]
+        key = Path(f"/home/{user}/.ssh/id_ed25519")
+        if key.exists():
+            argv += ["-o", f"IdentityFile={key}"]
+        kh = Path(f"/home/{user}/.ssh/known_hosts")
+        if kh.exists():
+            argv += ["-o", f"UserKnownHostsFile={kh}"]
+        return argv
+
+    def mount_remote_snapshot(self, snapshot: SnapshotInfo) -> Optional[Path]:
+        """Read-only SSHFS mount of a remote subvolume, returning the browsable
+        path (descended into the user's home dir for a `home` subvolume). Returns
+        None when it is not applicable or fails - the caller then falls back to
+        deploy_staging()'s full stream."""
+        if shutil.which("sshfs") is None:
+            return None
+        if (snapshot.snap_type != SnapshotType.REMOTE
+                or not snapshot.is_subvolume):
+            return None
+        config = Config.load()
+        if not config.remote_host:
+            return None
+        user = os.getenv("SUDO_USER") or os.getenv("USER") or getpass.getuser()
+
+        self._sweep_orphan_mounts()
+        base = self._remote_mnt_base()
+        base.mkdir(parents=True, exist_ok=True)
+        os.chmod(base, 0o755)
+        slug = re.sub(r"[^A-Za-z0-9_.-]", "_", snapshot.id or snapshot.name)[:48]
+        mnt = base / f"{os.getpid()}-{slug}"
+        mnt.mkdir(parents=True, exist_ok=True)
+
+        argv = self._sshfs_argv(snapshot, config, user, mnt)
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.warning("sshfs mount failed: %s", exc)
+            self._rmdir_quiet(mnt)
+            return None
+        if r.returncode != 0 or not os.path.ismount(mnt):
+            logger.warning("sshfs mount of %s failed: %s", snapshot.path,
+                           (r.stderr or "").strip() or f"exit {r.returncode}")
+            self._unmount_quiet(mnt)
+            self._rmdir_quiet(mnt)
+            return None
+
+        self._remote_mounts.append(mnt)
+        atexit.register(self._cleanup_remote_mounts)
+        logger.info("mounted %s read-only at %s", snapshot.path, mnt)
+
+        user_home = mnt / user
+        return user_home if user_home.is_dir() else mnt
+
+    def _unmount_quiet(self, mnt: Path, *, lazy: bool = False) -> None:
+        flag = "-uz" if lazy else "-u"
+        attempts = [["fusermount3", flag, str(mnt)],
+                    ["fusermount", flag, str(mnt)],
+                    ["umount"] + (["-l"] if lazy else []) + [str(mnt)]]
+        for cmd in attempts:
+            try:
+                if subprocess.run(cmd, capture_output=True,
+                                  timeout=15).returncode == 0:
+                    return
+            except (OSError, subprocess.SubprocessError):
+                continue
+
+    def _rmdir_quiet(self, p: Path) -> None:
+        try:
+            p.rmdir()
+        except OSError:
+            pass
+
+    def _cleanup_remote_mounts(self) -> None:
+        for mnt in list(self._remote_mounts):
+            self._unmount_quiet(mnt)
+            self._rmdir_quiet(mnt)
+        self._remote_mounts = []
+        base = self._remote_mnt_base()
+        if base.is_dir():
+            self._rmdir_quiet(base)
+
+    def _sweep_orphan_mounts(self) -> None:
+        """Lazy-unmount + remove remote-mount dirs left by dead runs (startup).
+        A dir whose pid is still alive (a parallel restore) is left alone."""
+        base = self._remote_mnt_base()
+        if not base.is_dir():
+            return
+        for entry in base.iterdir():
+            m = _STAGING_RUN_RE.match(entry.name)
+            if m and _pid_alive(int(m.group(1))):
+                continue
+            self._unmount_quiet(entry, lazy=True)
+            self._rmdir_quiet(entry)
 
     def _ssh_argv(self, config: Config, user: str) -> List[str]:
         """SSH options as a list - no shell string interpolation."""
@@ -546,10 +727,14 @@ class RestoreEngine:
             return [["zstd", "-dc", str(snapshot.path)], receive]
         return None
 
-    def deploy_staging(self, snapshot: SnapshotInfo) -> Path:
+    def deploy_staging(self, snapshot: SnapshotInfo,
+                       progress_cb: Optional[Callable[[str], None]] = None) -> Path:
         """Stream a remote or USB-stream snapshot into the staging dir and return
         the browsable path. A snapshot that is already a mounted subvolume needs
-        no staging and is returned directly."""
+        no staging and is returned directly. `progress_cb` receives pv's
+        byte/rate/elapsed line while the stream is received."""
+        if progress_cb is not None:
+            self._progress_cb = progress_cb
         if snapshot.is_subvolume and snapshot.snap_type == SnapshotType.USB:
             return snapshot.path
 
@@ -573,7 +758,7 @@ class RestoreEngine:
             self._cleanup_own_staging()
             return snapshot.path
 
-        self._run_pipeline(stages)
+        self._run_pipeline(stages, progress=True)
 
         for item in run_dir.iterdir():
             if item.is_dir():

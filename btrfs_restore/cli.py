@@ -104,6 +104,7 @@ def _paths() -> int:
         ("/.snapshots/.backup-tmp/<pid>-<ts>/", "transient backup state - swept on start / atexit"),
         ("/.snapshots/.backup-last.log", "last backup log (single file, overwritten)"),
         ("/.snapshots/staging/<pid>-<slug>/", "restore staging subvolume - swept on start / atexit"),
+        ("/.snapshots/.remote-mnt/<pid>-<slug>/", "read-only SSHFS mount of a remote snapshot - unmounted on start / atexit"),
         (str(cfg.target_root or "<USB>/btrfs-restore/"), "backups on the USB / target drive"),
         (f"{cfg.remote_host or '<remote>'}:{cfg.remote_path or '<path>'}/{{root,home,meta}}/",
          "backups on the SSH host"),
