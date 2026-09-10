@@ -78,6 +78,26 @@ if [ ! -d "${VENV_DIR}" ]; then
     fi
 fi
 
+# --- sshfs: browse a remote backup without streaming the whole subvolume -----
+# Optional. When present, restoring a few files from the SSH host mounts the
+# remote snapshot read-only and pulls only what you mark; without it the app
+# falls back to streaming the entire subvolume into staging.
+if ! command -v sshfs >/dev/null 2>&1; then
+    echo "--> installing sshfs (lightweight remote restore)"
+    if command -v pacman >/dev/null 2>&1; then
+        pacman -S --needed --noconfirm sshfs \
+            || echo "[!] sshfs install failed - remote restore will stream the full subvolume"
+    elif command -v apt-get >/dev/null 2>&1; then
+        apt-get install -y sshfs \
+            || echo "[!] sshfs install failed - remote restore will stream the full subvolume"
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y fuse-sshfs \
+            || echo "[!] sshfs install failed - remote restore will stream the full subvolume"
+    else
+        echo "[!] unknown package manager - install 'sshfs' yourself for lightweight remote restore"
+    fi
+fi
+
 echo "--> /usr/local/bin/{restore-tui,restore-now,backup-now}"
 ln -sf "${INSTALL_DIR}/bin/restore-tui"  /usr/local/bin/restore-tui
 ln -sf "${INSTALL_DIR}/bin/restore-now"  /usr/local/bin/restore-now
