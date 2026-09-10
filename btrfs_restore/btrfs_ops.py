@@ -5,12 +5,47 @@ Every call is built as an argv list - never a shell string - so paths and config
 values can never be interpreted by a shell (see issue #9). `BtrfsOps` is the real
 implementation; tests pass a fake with the same surface.
 """
+import os
 import shutil
+import signal
 import subprocess
 import threading
 import time
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence
+
+
+def _kill_process_group(procs: Sequence[subprocess.Popen], grace: float = 3.0) -> None:
+    """Tear down a pipeline that was interrupted (Ctrl-C, SIGTERM). Every stage is
+    spawned with ``start_new_session=True`` so it leads its own process group;
+    signalling that group also stops any child it forked and, for an ``ssh`` sink,
+    drops the channel so the remote ``btrfs receive`` sees EOF and exits. SIGTERM
+    first, then SIGKILL for whatever is still alive after `grace` seconds."""
+    def _signal(p: subprocess.Popen, sig: int) -> None:
+        if p.poll() is not None:
+            return
+        try:
+            os.killpg(os.getpgid(p.pid), sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                p.send_signal(sig)
+            except OSError:
+                pass
+
+    for p in procs:
+        _signal(p, signal.SIGTERM)
+    deadline = time.monotonic() + grace
+    for p in procs:
+        try:
+            p.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            pass
+    for p in procs:
+        _signal(p, signal.SIGKILL)
+        try:
+            p.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 def _human(n: float) -> str:
@@ -154,12 +189,20 @@ class BtrfsOps:
                     t.start()
                     readers.append(t)
         except FileNotFoundError:
-            for p in procs:
-                p.kill()
+            _kill_process_group(procs)
             raise
 
-        for p in procs:
-            p.wait()
+        try:
+            for p in procs:
+                p.wait()
+        except BaseException:
+            # Ctrl-C / SIGTERM mid-transfer: the stages are in their own session
+            # and never saw the terminal's SIGINT, so kill them here instead of
+            # leaving an orphaned `btrfs send | ssh` running.
+            _kill_process_group(procs)
+            for t in readers:
+                t.join(timeout=1.0)
+            raise
         for t in readers:
             t.join(timeout=1.0)
 
@@ -226,6 +269,9 @@ class BtrfsOps:
                     last = now
         except (BrokenPipeError, OSError):
             pass
+        except BaseException:
+            _kill_process_group((p_send, p_sink))
+            raise
         finally:
             for fh in (p_sink.stdin, p_send.stdout, p_send.stderr,
                        p_sink.stdout, p_sink.stderr):
@@ -293,13 +339,10 @@ class BtrfsOps:
         try:
             _, err = recv.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            for p in (recv, tar):
-                p.kill()
-            try:
-                recv.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
-            tar.wait()
+            _kill_process_group((recv, tar))
             return 124, f"timed out after {timeout}s"
+        except BaseException:
+            _kill_process_group((recv, tar))
+            raise
         tar.wait()
         return recv.returncode, (err.decode("utf-8", "replace").strip() if err else "")

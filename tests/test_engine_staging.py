@@ -3,7 +3,9 @@ deploy_staging builds argv-list pipelines - no shell, no interpolation (#9);
 staging dirs are pid-named and orphan-swept, never nuking a parallel run (#15).
 """
 import os
+import subprocess
 import tempfile
+import time
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -87,6 +89,16 @@ class TestStagingStages(unittest.TestCase):
         s = _snap(is_subvolume=True, path=Path("/backups/home_x"))
         stages = self.eng._staging_stages(s, self._cfg(), "bob", Path("/tmp/stg/123-home_x"))
         self.assertEqual(stages[1], ["btrfs", "receive", "/tmp/stg/123-home_x"])
+
+    def test_cancel_kills_a_stuck_transfer(self):
+        procs = [subprocess.Popen(["sleep", "30"], start_new_session=True)
+                 for _ in range(2)]
+        self.eng._active_procs = procs
+        self.eng.cancel_active_operation()
+        time.sleep(0.2)
+        for p in procs:
+            self.assertIsNotNone(p.poll(), "a transfer stage survived cancel")
+        self.assertEqual(self.eng._active_procs, [])
 
 
 class TestStagingResidue(unittest.TestCase):

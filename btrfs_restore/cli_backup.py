@@ -126,33 +126,43 @@ def main() -> None:
             border_style="red"))
         sys.exit(2)
 
-    if args.quiet or args.dry_run:
-        def quiet_cb(t, m):
-            if t == "progress":
-                console.print(f"  {m}", style="progress", end="\r", highlight=False)
-            else:
-                console.print(f"[{t}] {m}", style=t)
-        engine = BtrfsBackupEngine(cfg, callback=quiet_cb)
-        result = engine.run(dry_run=args.dry_run)
-    else:
-        dash = Dashboard("Synchronizing snapshots")
-        engine = BtrfsBackupEngine(cfg, callback=dash.on_event)
-        stop = threading.Event()
-        from rich.live import Live
+    try:
+        if args.quiet or args.dry_run:
+            def quiet_cb(t, m):
+                if t == "progress":
+                    console.print(f"  {m}", style="progress", end="\r", highlight=False)
+                else:
+                    console.print(f"[{t}] {m}", style=t)
+            engine = BtrfsBackupEngine(cfg, callback=quiet_cb)
+            result = engine.run(dry_run=args.dry_run)
+        else:
+            dash = Dashboard("Synchronizing snapshots")
+            engine = BtrfsBackupEngine(cfg, callback=dash.on_event)
+            stop = threading.Event()
+            from rich.live import Live
 
-        def refresh(live: "Live") -> None:
-            while not stop.is_set():
-                live.update(dash.render())
-                time.sleep(0.12)
+            def refresh(live: "Live") -> None:
+                while not stop.is_set():
+                    live.update(dash.render())
+                    time.sleep(0.12)
 
-        with Live(dash.render(), console=console, refresh_per_second=8, transient=True) as live:
-            rt = threading.Thread(target=refresh, args=(live,), daemon=True)
-            rt.start()
-            try:
-                result = engine.run(dry_run=False)
-            finally:
-                stop.set()
-                rt.join(timeout=1.0)
+            with Live(dash.render(), console=console, refresh_per_second=8, transient=True) as live:
+                rt = threading.Thread(target=refresh, args=(live,), daemon=True)
+                rt.start()
+                try:
+                    result = engine.run(dry_run=False)
+                finally:
+                    stop.set()
+                    rt.join(timeout=1.0)
+    except KeyboardInterrupt:
+        # the engine already killed the send/receive pipeline and marked the
+        # snapshot partial on its way out; just report and leave.
+        console.print(Panel(
+            "[bold yellow]BACKUP CANCELLED[/bold yellow]\n"
+            "Transfers were stopped. 'latest' was not moved; the partial "
+            "snapshot is cleaned up on the next run.",
+            border_style="yellow"))
+        sys.exit(130)
 
     _print_summary(result, args.dry_run)
     sys.exit(0 if result.ok else 1)

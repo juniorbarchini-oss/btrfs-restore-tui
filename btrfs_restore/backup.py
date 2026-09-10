@@ -375,6 +375,18 @@ class BtrfsBackupEngine:
             except OSError:
                 pass
             return "partial" if isinstance(exc, CommandError) else "failed"
+        except BaseException:
+            # Ctrl-C / SIGTERM mid-send: record it as partial so 'latest' is not
+            # moved and this dir is never picked as an incremental parent, then
+            # let the interrupt propagate (run()'s finally still cleans scratch).
+            self._emit("error", "USB: interrupted")
+            try:
+                self._write_manifest(snap_dir, status="partial",
+                                     failed_at=datetime.now().isoformat(),
+                                     error="interrupted")
+            except OSError:
+                pass
+            raise
 
     def _backup_to_remote(self, name: str, local_snaps: Dict[str, str],
                           state_dir: Path, result: BackupResult) -> str:

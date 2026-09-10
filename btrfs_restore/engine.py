@@ -51,17 +51,31 @@ class RestoreEngine:
 
     def cancel_active_operation(self) -> None:
         """Cancel any running streaming process and purge this run's staging."""
-        for proc in self._active_procs:
-            if proc.poll() is None:
+        self._kill_active_procs()
+        self._cleanup_own_staging()
+
+    def _kill_active_procs(self) -> None:
+        """SIGTERM every stage's process group, then SIGKILL whatever is still
+        alive - so a cancel actually stops a `btrfs send | ... | ssh` transfer
+        instead of leaving it running detached."""
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            alive = [p for p in self._active_procs if p.poll() is None]
+            if not alive:
+                break
+            for proc in alive:
                 try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                    os.killpg(os.getpgid(proc.pid), sig)
                 except (ProcessLookupError, PermissionError, OSError):
                     try:
-                        proc.terminate()
+                        proc.send_signal(sig)
                     except OSError:
                         pass
+            for proc in alive:
+                try:
+                    proc.wait(timeout=3.0)
+                except subprocess.TimeoutExpired:
+                    pass
         self._active_procs = []
-        self._cleanup_own_staging()
 
     def _run_pipeline(self, stages: List[List[str]]) -> None:
         """Run `stages[0] | stages[1] | ...` with argv lists (never a shell).
@@ -89,10 +103,16 @@ class RestoreEngine:
 
         self._active_procs = procs
         errs = []
-        for p in procs:
-            _, err = p.communicate()
-            if err:
-                errs.append(err.decode("utf-8", "replace").strip())
+        try:
+            for p in procs:
+                _, err = p.communicate()
+                if err:
+                    errs.append(err.decode("utf-8", "replace").strip())
+        except BaseException:
+            # Ctrl-C / SIGTERM mid-stream: the stages are in their own sessions
+            # and never saw the terminal's SIGINT - kill them here.
+            self._kill_active_procs()
+            raise
         self._active_procs = []
 
         failed = next((p for p in procs if p.returncode not in (0, None)), None)

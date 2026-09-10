@@ -1,12 +1,16 @@
 """
 btrfs_ops: argv-only command construction (no shell), progress plumbing.
 """
+import os
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from btrfs_restore.btrfs_ops import BtrfsOps, _human, prune_paths
+from btrfs_restore import btrfs_ops
+from btrfs_restore.btrfs_ops import BtrfsOps, _human, _kill_process_group, prune_paths
 
 
 class TestArgvSafety(unittest.TestCase):
@@ -68,6 +72,43 @@ class TestPrunePaths(unittest.TestCase):
     def test_missing_glob_is_a_noop(self):
         with tempfile.TemporaryDirectory() as d:
             self.assertEqual(prune_paths(Path(d), ["nope/*", "*/.cache"]), [])
+
+
+class TestPipelineCancel(unittest.TestCase):
+    def test_kill_process_group_stops_detached_stages(self):
+        procs = [subprocess.Popen(["sleep", "30"], start_new_session=True)
+                 for _ in range(2)]
+        _kill_process_group(procs, grace=1.0)
+        for p in procs:
+            self.assertIsNotNone(p.poll(), "stage still running after kill")
+
+    def test_run_pipeline_interrupt_leaves_no_orphans(self):
+        ops = BtrfsOps()
+        real_wait = subprocess.Popen.wait
+        fired, killed = [], []
+
+        def fake_wait(self, timeout=None):
+            if timeout is None and not fired:      # the bare wait() in run_pipeline
+                fired.append(True)
+                raise KeyboardInterrupt
+            return real_wait(self, timeout=timeout)
+
+        real_kill = btrfs_ops._kill_process_group
+
+        def spy_kill(procs, **kw):
+            killed.extend(procs)
+            return real_kill(procs, **kw)
+
+        with mock.patch.object(subprocess.Popen, "wait", fake_wait), \
+             mock.patch.object(btrfs_ops, "_kill_process_group", spy_kill), \
+             open(os.devnull, "wb") as out:
+            with self.assertRaises(KeyboardInterrupt):
+                ops.run_pipeline([["sleep", "30"], ["cat"]], final_stdout=out)
+
+        self.assertTrue(killed, "the pipeline was not torn down on interrupt")
+        time.sleep(0.2)
+        for p in killed:
+            self.assertIsNotNone(p.poll(), "a pipeline stage outlived the cancel")
 
 
 class TestPushTreeTimeout(unittest.TestCase):
