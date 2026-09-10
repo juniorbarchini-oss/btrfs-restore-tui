@@ -29,6 +29,7 @@ class FakeBtrfsOps:
         self.ssh_sent = []                          # (kind, parent_name) to remote
         self.remote_subvols = {"root": [], "home": []}
         self.ssh_calls = []
+        self.pushed_trees = []                       # [(remote_dir, {relpath: bytes})]
 
     def snapshot_ro(self, source: Path, dest: Path) -> None:
         dest.mkdir(parents=True, exist_ok=True)
@@ -95,6 +96,16 @@ class FakeBtrfsOps:
         return 0
 
     def push_tree(self, local_dir, ssh_argv, remote, remote_dir, timeout=120):
+        # snapshot the pushed tree (file names -> text) so tests can inspect it
+        from pathlib import Path as _P
+        pushed = {}
+        for p in _P(local_dir).rglob("*"):
+            if p.is_file():
+                try:
+                    pushed[str(p.relative_to(local_dir))] = p.read_bytes()
+                except OSError:
+                    pass
+        self.pushed_trees.append((remote_dir, pushed))
         return 0, ""
 
 
@@ -316,6 +327,31 @@ class TestBackupRemote(BackupTestBase):
         ops = FakeBtrfsOps(target_is_btrfs=True, fail_send_on={"homefs"})
         r = BtrfsBackupEngine(cfg, ops=ops).run()
         self.assertEqual(r.status, "partial", r.message)
+
+    def test_completed_remote_backup_pushes_a_recovery_kit(self):
+        cfg = self._remote_cfg()
+        ops = FakeBtrfsOps(target_is_btrfs=True)
+        r = BtrfsBackupEngine(cfg, ops=ops).run()
+        self.assertEqual(r.status, "completed", r.message)
+
+        kit = next((files for dest, files in ops.pushed_trees
+                    if dest.rstrip("/") == "/srv/backups"), None)
+        self.assertIsNotNone(kit, "recovery kit was not pushed to <base>/")
+        self.assertIn("disaster-recovery.sh", kit)
+        self.assertIn("RECOVERY.md", kit)
+        self.assertIn("btrfs-restore-tui-src.tar.gz", kit)
+        script = kit["disaster-recovery.sh"].decode()
+        self.assertIn("bob@10.0.0.9", script)          # placeholders filled in
+        self.assertIn("/srv/backups", script)
+        self.assertNotIn("@@", script)
+        import subprocess as sp, tempfile, os as _os
+        with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as fh:
+            fh.write(script)
+            path = fh.name
+        try:
+            self.assertEqual(sp.run(["bash", "-n", path]).returncode, 0)
+        finally:
+            _os.unlink(path)
 
     def test_no_target_at_all_fails(self):
         cfg = self.make_cfg()

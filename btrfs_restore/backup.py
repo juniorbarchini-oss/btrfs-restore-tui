@@ -29,6 +29,7 @@ import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -419,6 +420,7 @@ class BtrfsBackupEngine:
             self._emit("stage", "i7server: system state")
             self._push_state_remote(name, state_dir, ssh, remote, base)
             self._prune_remote(ssh, remote, base, result)
+            self._write_recovery_kit_remote(ssh, remote, base)
             return "completed"
         except CommandError as exc:
             self._emit("error", f"i7server: {exc}")
@@ -577,6 +579,46 @@ class BtrfsBackupEngine:
                                capture_output=True, timeout=60)
         except (OSError, subprocess.SubprocessError) as exc:
             self._emit("warning", f"recovery kit not written: {exc}")
+
+    def _write_recovery_kit_remote(self, ssh, remote: str, base: str) -> None:
+        """Drop a disaster-recovery entry point at <base>/ on the SSH host. The
+        remote layout is scattered (<base>/{root,home}/<name>_subvol +
+        <base>/meta/<name>/), so it needs its own script: run on the machine
+        being recovered, it pulls one snapshot's system state + home subvolume
+        down and hands off to that snapshot's restore.sh. Best-effort."""
+        try:
+            port = str(self.cfg.remote_port or 22)
+            kit = Path(tempfile.mkdtemp(prefix="btrfs-restore-kit-"))
+            try:
+                dr = kit / "disaster-recovery.sh"
+                dr.write_text(_DISASTER_RECOVERY_REMOTE_SH
+                              .replace("@@HOST@@", remote)
+                              .replace("@@BASE@@", base)
+                              .replace("@@PORT@@", port))
+                dr.chmod(0o755)
+                (kit / "RECOVERY.md").write_text(
+                    _RECOVERY_MD_REMOTE
+                    .replace("@@HOST_NAME@@", os.uname().nodename)
+                    .replace("@@REMOTE@@", remote)
+                    .replace("@@BASE@@", base)
+                    .replace("@@WHEN@@", datetime.now().strftime("%Y-%m-%d %H:%M")))
+
+                src_tar = kit / "btrfs-restore-tui-src.tar.gz"
+                pkg_root = Path(__file__).resolve().parents[1]
+                members = [m for m in ("btrfs_restore", "bin", "main.py", "install.sh",
+                                       "uninstall.sh", "requirements.txt",
+                                       "config.conf.example", "README.md")
+                           if (pkg_root / m).exists()]
+                subprocess.run(["tar", "czf", str(src_tar), "-C", str(pkg_root), *members],
+                               capture_output=True, timeout=60)
+
+                rc, err = self.ops.push_tree(kit, ssh, remote, base, timeout=120)
+                if rc != 0:
+                    self._emit("warning", f"i7server: recovery kit not written: {err or rc}")
+            finally:
+                shutil.rmtree(kit, ignore_errors=True)
+        except (OSError, subprocess.SubprocessError) as exc:
+            self._emit("warning", f"i7server: recovery kit not written: {exc}")
 
     def _prune_usb(self) -> List[str]:
         pruned: List[str] = []
@@ -761,4 +803,133 @@ read -r -p "Run ${PICK}/restore.sh now? type 'yes': " C
 
 cd "${SNAP}"
 exec ./restore.sh "$@"
+'''
+
+
+_RECOVERY_MD_REMOTE = """# Disaster recovery from @@REMOTE@@ — @@HOST_NAME@@
+
+This folder is at the root of **@@HOST_NAME@@**'s Btrfs backups on the SSH host
+`@@REMOTE@@` (`@@BASE@@`), made by btrfs-restore-tui. Kit written @@WHEN@@.
+
+The remote layout keeps each backup in three places:
+
+    @@BASE@@/root/root_<compact>     received / subvolume
+    @@BASE@@/home/home_<compact>     received /home subvolume
+    @@BASE@@/meta/<name>/            _system_state/ + restore.sh
+
+(`<name>` is `YYYY-MM-DD_HHMMSS`; `<compact>` is the same without the dashes.)
+
+## Recover a machine (bare metal)
+
+1. Install a fresh Arch base on the new machine (btrfs root, your user created),
+   or boot a live ISO with the new root mounted at /mnt.
+2. Make sure you can `ssh @@REMOTE@@` (copy a key or use a password).
+3. Copy `disaster-recovery.sh` from here to the new machine and run it there:
+
+       ./disaster-recovery.sh                 # newest snapshot
+       ./disaster-recovery.sh --snapshot 3    # pick from the list
+       ./disaster-recovery.sh -- --root /mnt  # from a live ISO
+
+   It pulls that snapshot's `_system_state/` + home subvolume into
+   `./btrfs-restore-recovery/<name>/` and runs its `restore.sh` (pacman config +
+   mirrors, explicit + AUR packages, Flatpaks, /etc bits, systemd units, home).
+
+4. Afterwards: check /etc/fstab and the bootloader config under
+   `_system_state/bootloader/`, run `sudo mkinitcpio -P` if needed, reboot.
+
+## Restore the exact root filesystem instead of replaying packages
+
+With the new root mounted at /mnt:
+
+    ssh @@REMOTE@@ 'sudo btrfs send @@BASE@@/root/root_<compact>' \\
+        | sudo btrfs receive /mnt
+    # then fix /mnt/etc/fstab + the bootloader for the new disk UUIDs.
+
+## Notes
+
+- Needs only: bash, coreutils, openssh, rsync, btrfs-progs, zstd. No Python, no app.
+- If python3 is missing on the fresh machine, `export SUDO_USER=<you>` before
+  running so restore.sh targets the right home.
+- The app source is in `btrfs-restore-tui-src.tar.gz` here (for the retro file
+  browser once the machine is back up).
+"""
+
+
+# Run ON the machine being recovered. Placeholders (@@HOST@@ etc.) are filled in
+# at backup time; everything else is literal bash, so this is never .format()ted.
+_DISASTER_RECOVERY_REMOTE_SH = r'''#!/usr/bin/env bash
+# =============================================================================
+# btrfs-restore-tui - Disaster Recovery from the SSH backup host
+# Run this ON THE MACHINE BEING RECOVERED (fresh Arch base, or live ISO with the
+# new root at /mnt). It needs SSH access to the backup host. It pulls one
+# snapshot's system state + home subvolume down and hands off to its restore.sh.
+# Args after `--` are passed through to restore.sh (e.g. --root /mnt).
+# Needs: bash, coreutils, openssh, rsync, btrfs-progs, zstd. No Python, no app.
+# =============================================================================
+set -euo pipefail
+
+HOST="@@HOST@@"
+BASE="@@BASE@@"
+PORT="@@PORT@@"
+WORK="${PWD}/btrfs-restore-recovery"
+PICK=""
+
+SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10)
+[ "${PORT}" != "22" ] && SSH_OPTS+=(-p "${PORT}")
+
+PASS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --host)     HOST="$2"; shift 2 ;;
+        --snapshot) PICK="$2"; shift 2 ;;
+        --)         shift; PASS=("$@"); break ;;
+        -h|--help)  grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *)          echo "unknown option: $1"; exit 2 ;;
+    esac
+done
+
+echo "Backup host : ${HOST}:${BASE}"
+mapfile -t NAMES < <(ssh "${SSH_OPTS[@]}" "${HOST}" "ls -1 ${BASE}/meta 2>/dev/null" | sort -r)
+[ "${#NAMES[@]}" -gt 0 ] || { echo "no snapshots under ${HOST}:${BASE}/meta"; exit 1; }
+
+echo "Snapshots on the host (newest first):"
+i=0
+for n in "${NAMES[@]}"; do printf '  [%d] %s\n' "${i}" "${n}"; i=$((i + 1)); done
+
+DEFAULT="${NAMES[0]}"
+if [ -z "${PICK}" ]; then
+    read -r -p "Snapshot to restore (name or number) [${DEFAULT}]: " PICK
+    PICK="${PICK:-${DEFAULT}}"
+fi
+case "${PICK}" in ''|*[!0-9]*) ;; *) PICK="${NAMES[${PICK}]:-${PICK}}" ;; esac
+COMPACT="${PICK//-/}"
+echo
+echo "=== ${PICK}  (subvolumes home_${COMPACT} / root_${COMPACT}) ==="
+
+SNAP="${WORK}/${PICK}"
+mkdir -p "${SNAP}"
+
+echo "[1/3] system state + restore.sh  ->  ${SNAP}"
+rsync -aAX -e "ssh ${SSH_OPTS[*]}" "${HOST}:${BASE}/meta/${PICK}/" "${SNAP}/"
+
+echo "[2/3] home subvolume"
+if ssh "${SSH_OPTS[@]}" "${HOST}" "sudo -n btrfs subvolume show ${BASE}/home/home_${COMPACT}" >/dev/null 2>&1; then
+    ssh "${SSH_OPTS[@]}" "${HOST}" "sudo btrfs send ${BASE}/home/home_${COMPACT}" \
+        | sudo btrfs receive "${SNAP}/"
+else
+    echo "  ! cannot read ${BASE}/home/home_${COMPACT} on ${HOST}"
+    echo "    (need working 'sudo btrfs' there) - restore.sh will run without home data"
+fi
+
+echo "[3/3] hand off to restore.sh"
+[ -x "${SNAP}/restore.sh" ] || { echo "no runnable restore.sh in ${SNAP}"; exit 1; }
+if [ -f "${SNAP}/_system_state/pkglist_explicit.txt" ]; then
+    echo "  packages : $(wc -l < "${SNAP}/_system_state/pkglist_explicit.txt")"
+fi
+echo
+read -r -p "Run ${PICK}/restore.sh now? type 'yes': " C
+[ "${C}" = "yes" ] || { echo "aborted (pulled data kept in ${SNAP})"; exit 0; }
+
+cd "${SNAP}"
+exec ./restore.sh "${PASS[@]}"
 '''
