@@ -54,7 +54,7 @@ class TestCliDispatch(unittest.TestCase):
              mock.patch.object(cli.console, "print", side_effect=lambda *a, **k: seen.append(a)):
             with self.assertRaises(SystemExit):
                 cli.main()
-        self.assertTrue(any("Opcion" in str(a) for a in seen))
+        self.assertTrue(any("Pick one" in str(a) for a in seen))
 
     def test_run_mode_builds_module_command_and_returns_code(self):
         with mock.patch.object(cli.os, "geteuid", return_value=0), \

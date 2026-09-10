@@ -1,10 +1,10 @@
 """
 `restore-tui` - single entry point. With no arguments it shows a retro menu:
 
-    [B]  Backup ahora
-    [R]  Restaurar archivos / carpetas
-    [F]  Recuperacion total (equipo recien instalado)
-    [Q]  Salir
+    [B]  Backup now
+    [R]  Restore files / folders
+    [F]  Full recovery (freshly installed machine)
+    [Q]  Quit
 
 `restore-tui backup [...]` and `restore-tui restore` jump straight into a mode
 (so do the `backup-now` / `restore-now` aliases). Privilege elevation is
@@ -72,22 +72,22 @@ def _show_recovery_info():
     body.append("\nTo recover just a few files instead, use ", style="#00FF66")
     body.append("Restore", style="bold yellow")
     body.append(" from the menu.", style="#00FF66")
-    console.print(Panel(body, border_style="#00FF66", title="[bold #00FF66]Recuperacion total[/]"))
+    console.print(Panel(body, border_style="#00FF66", title="[bold #00FF66]Full recovery[/]"))
 
 
 def _print_menu():
     cfg = Config.load()
     host = os.uname().nodename
     dest = (cfg.target_root or (cfg.remote_name if cfg.remote_host else None)
-            or "(sin destino - enchufá el USB)")
+            or "(no target - plug in the USB)")
     header = Text()
     header.append("  BTRFS RESTORE TUI ", style="bold #00FF66")
     header.append("- AGY Time Machine\n", style="#00FF66")
-    header.append(f"  Origen: {host}   FS: btrfs   Destino: {dest}\n\n", style="dim #00FF66")
-    header.append("   [B]  Backup ahora\n", style="#00FF66")
-    header.append("   [R]  Restaurar archivos / carpetas\n", style="#00FF66")
-    header.append("   [F]  Recuperacion total (equipo recien instalado)\n", style="#00FF66")
-    header.append("   [Q]  Salir", style="#00FF66")
+    header.append(f"  Source: {host}   FS: btrfs   Target: {dest}\n\n", style="dim #00FF66")
+    header.append("   [B]  Backup now\n", style="#00FF66")
+    header.append("   [R]  Restore files / folders\n", style="#00FF66")
+    header.append("   [F]  Full recovery (freshly installed machine)\n", style="#00FF66")
+    header.append("   [Q]  Quit", style="#00FF66")
     console.print(Panel(header, border_style="#00FF66"))
 
 
@@ -111,7 +111,7 @@ def _menu() -> int:
         elif choice in ("q", "quit", "salir", ""):
             return 0
         else:
-            console.print("[yellow]  Opcion: B, R, F o Q[/]")
+            console.print("[yellow]  Pick one: B, R, F or Q[/]")
 
 
 def main() -> None:
