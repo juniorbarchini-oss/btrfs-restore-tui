@@ -23,4 +23,6 @@ for a in "$@"; do
     esac
 done
 
-exec "${VENV}/bin/pytest" "${ARGS[@]}"
+# `python -m pytest` (not the bare console script) so the repo root is importable
+# even when this runs via sudo with a different CWD / environment.
+exec "${VENV}/bin/python" -m pytest "${ARGS[@]}"
