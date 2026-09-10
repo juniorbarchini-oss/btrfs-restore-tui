@@ -77,6 +77,7 @@ class ConfirmRestoreModal(ModalScreen[Optional[ConflictResolution]]):
         Binding("escape", "cancel", "Cancel"),
         Binding("b", "choose_bak", "Backup (.bak)"),
         Binding("o", "choose_overwrite", "Overwrite"),
+        Binding("s", "choose_skip", "Skip existing"),
     ]
 
     def __init__(self, items: List[RestoreItem], target_path: Path,
@@ -94,6 +95,9 @@ class ConfirmRestoreModal(ModalScreen[Optional[ConflictResolution]]):
 
     def action_choose_overwrite(self) -> None:
         self.dismiss(ConflictResolution.OVERWRITE)
+
+    def action_choose_skip(self) -> None:
+        self.dismiss(ConflictResolution.SKIP)
 
     def compose(self) -> ComposeResult:
         total_size = sum(i.size_bytes for i in self.items)
@@ -116,6 +120,7 @@ class ConfirmRestoreModal(ModalScreen[Optional[ConflictResolution]]):
             with Horizontal(id="modal-buttons"):
                 yield Button("<B> Backup (.bak)", id="btn-bak", variant="primary")
                 yield Button("<O> Overwrite", id="btn-overwrite", variant="warning")
+                yield Button("<S> Skip existing", id="btn-skip", variant="default")
                 yield Button("<C> Cancel (Esc)", id="btn-cancel", variant="default")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -123,6 +128,8 @@ class ConfirmRestoreModal(ModalScreen[Optional[ConflictResolution]]):
             self.dismiss(ConflictResolution.BACKUP)
         elif event.button.id == "btn-overwrite":
             self.dismiss(ConflictResolution.OVERWRITE)
+        elif event.button.id == "btn-skip":
+            self.dismiss(ConflictResolution.SKIP)
         else:
             self.dismiss(None)
 

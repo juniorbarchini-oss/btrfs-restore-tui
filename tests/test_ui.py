@@ -1,7 +1,8 @@
 import unittest
+from pathlib import Path
 from textual.app import App, ComposeResult
-from btrfs_restore.ui import ProgressModal
-from btrfs_restore.models import RestoreProgress
+from btrfs_restore.ui import ProgressModal, ConfirmRestoreModal
+from btrfs_restore.models import RestoreProgress, RestoreItem, ConflictResolution
 from btrfs_restore.theme import RETRO_CSS
 
 
@@ -57,6 +58,23 @@ class TestUIModals(unittest.IsolatedAsyncioTestCase):
             fname = modal.query_one("#progress-filename")
             self.assertIn("b.txt", str(fname.render()))
             self.assertIn("Permission denied", str(fname.render()))
+
+
+    async def test_confirm_restore_modal_has_skip(self):
+        app = ModalButtonTestApp()
+        async with app.run_test(size=(100, 30)) as pilot:
+            item = RestoreItem(Path("/s/f"), False, 10, Path("f"))
+            result = {}
+            modal = ConfirmRestoreModal([item], Path("/home/x"))
+
+            def _catch(r):
+                result["r"] = r
+            app.push_screen(modal, _catch)
+            await pilot.pause()
+            self.assertTrue(modal.query("#btn-skip"))
+            await pilot.press("s")
+            await pilot.pause()
+            self.assertEqual(result["r"], ConflictResolution.SKIP)
 
 
 if __name__ == "__main__":
