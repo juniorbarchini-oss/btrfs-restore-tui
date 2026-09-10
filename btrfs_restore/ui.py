@@ -27,6 +27,12 @@ from .scanner import SnapshotScanner
 from .theme import RETRO_CSS, SPINNER_FRAMES
 
 
+def _unwind_on_signal(signum, _frame):
+    """Signal-safe: just raise. atexit + on_unmount do the staging cleanup;
+    calling subprocess or App.exit() from signal context can hang."""
+    raise SystemExit(128 + signum)
+
+
 class SnapshotSelectModal(ModalScreen[Optional[SnapshotInfo]]):
     """Retro modal to select which Btrfs snapshot to explore."""
 
@@ -354,13 +360,14 @@ class BtrfsRestoreApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        # Foolproof staging cleanup: our own run on exit/signal, dead-pid
-        # orphans (not a parallel run's) on startup.
+        # Foolproof staging cleanup: atexit + on_unmount handle it. The signal
+        # handlers only unwind (SystemExit) - which runs both - so nothing
+        # unsafe happens in signal context.
         atexit.register(self.engine._cleanup_own_staging)
         try:
-            signal.signal(signal.SIGTERM, lambda s, f: (self.engine._cleanup_own_staging(), self.exit()))
-            signal.signal(signal.SIGHUP, lambda s, f: (self.engine._cleanup_own_staging(), self.exit()))
-        except Exception:
+            signal.signal(signal.SIGTERM, _unwind_on_signal)
+            signal.signal(signal.SIGHUP, _unwind_on_signal)
+        except (ValueError, OSError):
             pass
 
         # Purge staging left by dead runs on startup (keep a parallel run's)

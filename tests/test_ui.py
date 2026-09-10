@@ -60,6 +60,13 @@ class TestUIModals(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Permission denied", str(fname.render()))
 
 
+    def test_signal_handler_only_unwinds(self):
+        from btrfs_restore.ui import _unwind_on_signal
+        import signal as _sig
+        with self.assertRaises(SystemExit) as e:
+            _unwind_on_signal(_sig.SIGTERM, None)
+        self.assertEqual(e.exception.code, 128 + int(_sig.SIGTERM))
+
     async def test_confirm_restore_modal_has_skip(self):
         app = ModalButtonTestApp()
         async with app.run_test(size=(100, 30)) as pilot:

@@ -133,6 +133,19 @@ class TestStagingResidue(unittest.TestCase):
         self.eng.cleanup_staging()
         self.assertEqual(list(self.eng.staging_dir.iterdir()), [])
 
+    def test_resolve_staging_dir_prefers_configured_btrfs(self):
+        self.eng._config.staging_dir = Path("/tmp/cfg-stg")
+        with mock.patch("btrfs_restore.engine._fstype_of",
+                        side_effect=lambda p: "btrfs"):
+            self.assertEqual(self.eng._resolve_staging_dir(), Path("/tmp/cfg-stg"))
+
+    def test_resolve_staging_dir_errors_when_nothing_is_btrfs(self):
+        self.eng._config.staging_dir = None
+        with mock.patch("btrfs_restore.engine._fstype_of", side_effect=lambda p: "ext4"):
+            with self.assertRaises(RuntimeError) as e:
+                self.eng._resolve_staging_dir()
+        self.assertIn("btrfs", str(e.exception).lower())
+
     def test_cleanup_own_staging_only_touches_the_tracked_run(self):
         mine = self._mkrun(f"{os.getpid()}-mine")
         other = self._mkrun(f"{os.getpid()}-other")
