@@ -10,7 +10,12 @@ APP_NAME="btrfs-restore-tui"
 INSTALL_DIR="/opt/${APP_NAME}"
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REAL_USER="${SUDO_USER:-$(id -un)}"
+REAL_HOME="$(getent passwd "${REAL_USER}" | cut -d: -f6)"
 DESKTOP_ENTRY="/usr/share/applications/btrfs-restore.desktop"
+
+# --upgrade / --force accepted for forward-compat; install.sh is already
+# idempotent and never touches snapshots or an existing config.
+for a in "$@"; do case "$a" in --upgrade|--force) ;; *) echo "unknown option: $a"; exit 2 ;; esac; done
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "[!] needs root - re-running with sudo"
@@ -18,6 +23,19 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 echo "=== Installing ${APP_NAME} ==="
+
+# Retire the loose pre-app backup-now script (AGY, ~/.local/bin, unversioned):
+# archive a copy next to the user config, then take it off PATH so the app's
+# own command is the only backup-now.
+LEGACY="${REAL_HOME}/.local/bin/backup-now"
+if [ -f "${LEGACY}" ] && ! grep -q "btrfs_restore.cli_backup" "${LEGACY}" 2>/dev/null; then
+    ARCHIVE="${REAL_HOME}/.config/btrfs-restore/legacy-backup-now.sh.bak"
+    echo "--> retiring legacy ${LEGACY}"
+    install -d -o "${REAL_USER}" -g "${REAL_USER}" "$(dirname "${ARCHIVE}")"
+    install -m 600 -o "${REAL_USER}" -g "${REAL_USER}" "${LEGACY}" "${ARCHIVE}"
+    rm -f "${LEGACY}"
+    echo "    archived to ${ARCHIVE}"
+fi
 
 echo "--> ${INSTALL_DIR}"
 mkdir -p "${INSTALL_DIR}"
@@ -54,7 +72,12 @@ Keywords=btrfs;backup;restore;snapshot;timemachine;
 EOF
 chmod 644 "${DESKTOP_ENTRY}"
 
+chmod +x "${SRC_DIR}/uninstall.sh" 2>/dev/null || true
+
 echo "=== Done ==="
-echo "  restore-tui   menu: backup / restore / recovery"
-echo "  backup-now    incremental btrfs backup to USB / SSH"
-echo "  restore-now   retro TUI to browse & recover files"
+echo "  restore-tui           menu: backup / restore / recovery"
+echo "  backup-now            incremental btrfs backup to USB / SSH"
+echo "  restore-now          retro TUI to browse & recover files"
+echo "  restore-tui --gc      clear staging / scratch from dead runs"
+echo "  restore-tui --paths   list every path the tool touches"
+echo "  sudo ./uninstall.sh   remove it all (keeps your data unless --purge)"

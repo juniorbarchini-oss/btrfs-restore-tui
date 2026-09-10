@@ -24,6 +24,26 @@ class TestCliDispatch(unittest.TestCase):
                 cli.main()
         rr.assert_called_once()
 
+    def test_gc_and_paths_route(self):
+        with mock.patch.object(cli, "_gc", return_value=0) as g, \
+             mock.patch.object(sys, "argv", ["restore-tui", "--gc"]):
+            with self.assertRaises(SystemExit):
+                cli.main()
+        g.assert_called_once()
+        with mock.patch.object(cli, "_paths", return_value=0) as p, \
+             mock.patch.object(sys, "argv", ["restore-tui", "--paths"]):
+            with self.assertRaises(SystemExit):
+                cli.main()
+        p.assert_called_once()
+
+    def test_paths_lists_known_locations(self):
+        with mock.patch.object(cli.console, "print") as pr:
+            cli._paths()
+        out = " ".join(str(c.args[0]) for c in pr.call_args_list if c.args)
+        self.assertIn("/opt/btrfs-restore-tui/", out)
+        self.assertIn(".config/btrfs-restore/config.conf", out)
+        self.assertIn("/.snapshots/staging/", out)
+
     def test_menu_q_exits_cleanly(self):
         with mock.patch.object(sys, "argv", ["restore-tui"]), \
              mock.patch.object(cli.console, "input", return_value="q"), \

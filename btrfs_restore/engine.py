@@ -1,6 +1,8 @@
+import atexit
 import errno
 import logging
 import os
+import re
 import shutil
 import signal
 import getpass
@@ -14,6 +16,18 @@ from .models import ConflictResolution, RestoreItem, RestoreProgress, SnapshotIn
 logger = logging.getLogger("btrfs_restore")
 
 _DEFAULT_STAGING = Path("/.snapshots/staging")
+# staging run dir name: "<pid>-<slug>"
+_STAGING_RUN_RE = re.compile(r"^(\d+)-")
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 class RestoreEngine:
@@ -33,9 +47,10 @@ class RestoreEngine:
             self.target_gid = os.getgid()
 
         self._user = os.getenv("SUDO_USER") or os.getenv("USER") or getpass.getuser()
+        self._staging_run: Optional[Path] = None
 
     def cancel_active_operation(self) -> None:
-        """Cancel any running streaming process and purge staging subvolumes."""
+        """Cancel any running streaming process and purge this run's staging."""
         for proc in self._active_procs:
             if proc.poll() is None:
                 try:
@@ -46,7 +61,7 @@ class RestoreEngine:
                     except OSError:
                         pass
         self._active_procs = []
-        self.cleanup_staging()
+        self._cleanup_own_staging()
 
     def _run_pipeline(self, stages: List[List[str]]) -> None:
         """Run `stages[0] | stages[1] | ...` with argv lists (never a shell).
@@ -303,17 +318,42 @@ class RestoreEngine:
         else:
             yield _state(current_file="Completed", done=True)
 
-    def cleanup_staging(self) -> None:
-        """Delete temporary subvolumes in the staging dir."""
+    def _purge_staging_path(self, p: Path) -> None:
+        """Delete a btrfs subvolume at `p`, or if `p` is a plain dir recurse into
+        it (a `<pid>-<slug>/` run dir holds the received subvolume) and remove
+        the dir itself."""
+        try:
+            r = subprocess.run(["btrfs", "subvolume", "delete", str(p)],
+                               capture_output=True, timeout=15)
+            if r.returncode == 0:
+                return
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.warning("could not delete staging subvolume %s: %s", p, exc)
+        if p.is_dir() and not p.is_symlink():
+            for child in list(p.iterdir()):
+                self._purge_staging_path(child)
+            try:
+                p.rmdir()
+            except OSError:
+                shutil.rmtree(p, ignore_errors=True)
+
+    def cleanup_staging(self, *, orphans_only: bool = False) -> None:
+        """Purge staging run dirs. `orphans_only` keeps dirs whose pid is still
+        running (a parallel backup/restore) - used on startup."""
         if not self.staging_dir.exists():
             return
-        for item in self.staging_dir.iterdir():
-            if item.is_dir():
-                try:
-                    subprocess.run(["btrfs", "subvolume", "delete", str(item)],
-                                   capture_output=True, timeout=15)
-                except (OSError, subprocess.SubprocessError) as exc:
-                    logger.warning("could not delete staging subvolume %s: %s", item, exc)
+        for entry in self.staging_dir.iterdir():
+            if orphans_only:
+                m = _STAGING_RUN_RE.match(entry.name)
+                if m and _pid_alive(int(m.group(1))):
+                    continue
+            self._purge_staging_path(entry)
+
+    def _cleanup_own_staging(self) -> None:
+        run = self._staging_run
+        if run is not None and run.exists():
+            self._purge_staging_path(run)
+        self._staging_run = None
 
     def _ssh_argv(self, config: Config, user: str) -> List[str]:
         """SSH options as a list - no shell string interpolation."""
@@ -330,11 +370,12 @@ class RestoreEngine:
         return argv
 
     def _staging_stages(self, snapshot: SnapshotInfo, config: Config,
-                        user: str) -> Optional[List[List[str]]]:
+                        user: str, receive_into: Optional[Path] = None
+                        ) -> Optional[List[List[str]]]:
         """Argv-list pipeline to stage `snapshot`, or None if it needs no staging
         (a mounted subvolume). Paths and config values are always single argv
         elements - never spliced into a shell string."""
-        receive = ["btrfs", "receive", str(self.staging_dir)]
+        receive = ["btrfs", "receive", str(receive_into or self.staging_dir)]
         if snapshot.snap_type == SnapshotType.REMOTE:
             if not config.remote_host:
                 raise RuntimeError("Remote host is not configured "
@@ -358,19 +399,28 @@ class RestoreEngine:
 
         self.staging_dir.mkdir(parents=True, exist_ok=True)
         os.chmod(self.staging_dir, 0o755)
-        self.cleanup_staging()
+        self.cleanup_staging(orphans_only=True)   # clear dead runs, keep parallel ones
+        self._cleanup_own_staging()               # drop our previous deploy, if any
 
         config = Config.load()
         user = os.getenv("SUDO_USER") or os.getenv("USER") or getpass.getuser()
-        stages = self._staging_stages(snapshot, config, user)
+
+        slug = re.sub(r"[^A-Za-z0-9_.-]", "_", snapshot.id or snapshot.name)[:48]
+        run_dir = self.staging_dir / f"{os.getpid()}-{slug}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        self._staging_run = run_dir
+        atexit.register(self._cleanup_own_staging)
+
+        stages = self._staging_stages(snapshot, config, user, run_dir)
         if stages is None:  # LOCAL - always a mounted subvolume
+            self._cleanup_own_staging()
             return snapshot.path
 
         self._run_pipeline(stages)
 
-        for item in self.staging_dir.iterdir():
+        for item in run_dir.iterdir():
             if item.is_dir():
                 user_home = item / user
                 return user_home if user_home.exists() else item
 
-        raise RuntimeError(f"No received subvolume found in {self.staging_dir}")
+        raise RuntimeError(f"No received subvolume found in {run_dir}")
