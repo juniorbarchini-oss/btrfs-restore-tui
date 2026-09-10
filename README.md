@@ -93,12 +93,16 @@ original location or extract them elsewhere.
 | `r` | Restore selected items to their original path |
 | `e` | Extract selected items to a chosen directory |
 | `s` | Switch snapshot (Local / USB / Remote) |
-| `q` | Clean staging and quit |
+| `q` | Unmount / clean staging and quit |
 
 **Sources.** Local subvolumes and Snapper snapshots (instant), mounted USB
-drives, and an SSH host — remote snapshots are streamed into a validated Btrfs
-staging subvolume (`/.snapshots/staging/<pid>-<slug>/`, or `STAGING_DIR`) and
-cleaned up on exit; a killed run's staging is swept on the next start.
+drives, and an SSH host. A remote snapshot is first mounted **read-only over
+SSHFS** (`/.snapshots/.remote-mnt/<pid>-<slug>/`) so you can browse it and pull
+only the files you mark — nothing else crosses the network. If SSHFS is
+unavailable, or you need the whole subvolume back, it falls back to streaming it
+into a validated Btrfs staging subvolume (`/.snapshots/staging/<pid>-<slug>/`,
+or `STAGING_DIR`) with a live byte/rate readout. Both are cleaned up on exit and
+swept on the next start after a killed run.
 
 **Conflicts.** When a file already exists: `<B>` back it up as `.bak`, `<O>`
 overwrite, `<S>` skip existing, `<C>` cancel.
@@ -172,17 +176,20 @@ file is never rewritten by the program.
 ## 6. Install
 
 ```bash
-# Arch / Omarchy
-sudo pacman -S python-textual python-rich btrfs-progs zstd pv openssh
-# Debian/Ubuntu (btrfs root): apt install python3-textual python3-rich btrfs-progs zstd pv openssh-client
-# Fedora:                     dnf install python3-textual python3-rich btrfs-progs zstd pv openssh-clients
+# System tools the app shells out to (Python packages are NOT needed system-wide):
+sudo pacman -S btrfs-progs zstd pv openssh sshfs          # Arch / Omarchy
+# Debian/Ubuntu (btrfs root):  apt install btrfs-progs zstd pv openssh-client sshfs
+# Fedora:                      dnf install btrfs-progs zstd pv openssh-clients fuse-sshfs
 
 sudo ./install.sh          # -> /opt/btrfs-restore-tui, symlinks in /usr/local/bin, .desktop
 ```
 
-`install.sh` also retires a pre-existing loose `~/.local/bin/backup-now` (the
-AGY script this engine replaces): it archives a copy to
-`~/.config/btrfs-restore/legacy-backup-now.sh.bak` and takes it off `PATH`.
+`install.sh` builds a self-contained `/opt/btrfs-restore-tui/.venv` with
+`textual` + `rich` (falling back to system Python only if `venv` is
+unavailable), installs `sshfs` when missing, and retires a pre-existing loose
+`~/.local/bin/backup-now` (the AGY script this engine replaces) — archiving a
+copy to `~/.config/btrfs-restore/legacy-backup-now.sh.bak` and taking it off
+`PATH`.
 
 `sudo ./uninstall.sh` reverses it (`--yes` = app only, `--purge` = also config
 and the legacy script; snapshots always need a typed `DELETE`).
@@ -191,9 +198,14 @@ and the legacy script; snapshots always need a typed `DELETE`).
 
 ## 7. Stack
 
-Python 3 · `textual` (TUI) · `rich` (backup dashboard) · `btrfs-progs`, `zstd`,
-`pv`, OpenSSH. Deployed to `/opt/btrfs-restore-tui/`; commands
+Python 3 · `textual` (TUI) · `rich` (backup dashboard), both in a bundled venv ·
+`btrfs-progs`, `zstd`, `pv`, OpenSSH, `sshfs` (optional, for lightweight remote
+browse). Deployed to `/opt/btrfs-restore-tui/`; commands
 `restore-tui` / `backup-now` / `restore-now` in `/usr/local/bin/`.
+
+**Tests.** `./run-tests.sh` (bootstraps `.venv` from `requirements-dev.txt`,
+runs `pytest`). `sudo ./run-tests.sh --e2e` adds the loop-device end-to-end
+test that exercises real `btrfs send`/`receive`.
 
 ---
 
