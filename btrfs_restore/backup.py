@@ -21,11 +21,13 @@ Safety rules (ported from the ext4 engine):
   * Local RO snapshots are kept only as `btrfs send -p` parents for the next run;
     the last completed one per kind is never pruned.
 """
+import atexit
 import json
 import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -42,8 +44,28 @@ logger = logging.getLogger("btrfs_restore")
 MANIFEST_VERSION = 1
 _SNAPSHOT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}(?:_\d)?$")
 _COMPACT_RE = re.compile(r"^([A-Za-z0-9-]+)_\d{8}_\d{6}(?:_\d)?$")
+# per-run scratch dir name: "<pid>-<YYYYMMDD_HHMMSS>"
+_RUN_TMP_RE = re.compile(r"^(\d+)-\d{8}_\d{6}$")
+# legacy scratch left in /.snapshots by pre-#1d runs
+_LEGACY_TMP_RE = re.compile(r"^\.(state|backup)-\d{8}_\d{6}(\.log)?$")
 
 EventCallback = Callable[[str, str], None]  # (event_type, message)
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _raise_on_sigterm(signum, _frame):
+    # SystemExit still runs the `finally` blocks that clean the scratch dir,
+    # unlike the default SIGTERM disposition.
+    raise SystemExit(128 + signum)
 
 
 @dataclass
@@ -88,6 +110,52 @@ class BtrfsBackupEngine:
             except OSError:
                 pass
         self._external_cb(event_type, message)
+
+    # -- per-run scratch dir ---------------------------------------
+
+    @property
+    def _tmp_root(self) -> Path:
+        return self.cfg.local_snapshots_dir / ".backup-tmp"
+
+    def _sweep_stale_tmp(self) -> None:
+        """Drop scratch dirs left by a backup that was hard-killed (SIGKILL,
+        power loss) - the `finally` block never ran for it. A dir is stale when
+        the pid in its name is no longer running. Also clears the pre-#1d
+        `.state-*` / `.backup-*.log` residue once it is a few hours old."""
+        root = self._tmp_root
+        try:
+            entries = list(root.iterdir()) if root.is_dir() else []
+        except OSError:
+            entries = []
+        for entry in entries:
+            m = _RUN_TMP_RE.match(entry.name)
+            if m and not _pid_alive(int(m.group(1))):
+                shutil.rmtree(entry, ignore_errors=True)
+                self._emit("info", f"swept stale scratch dir {entry.name}")
+
+        try:
+            legacy = list(self.cfg.local_snapshots_dir.iterdir())
+        except OSError:
+            legacy = []
+        cutoff = time.time() - 6 * 3600
+        for entry in legacy:
+            if not _LEGACY_TMP_RE.match(entry.name):
+                continue
+            try:
+                if entry.stat().st_mtime > cutoff:
+                    continue
+                if entry.is_dir():
+                    shutil.rmtree(entry, ignore_errors=True)
+                else:
+                    entry.unlink()
+                self._emit("info", f"swept legacy scratch {entry.name}")
+            except OSError:
+                pass
+
+    def _cleanup_run_tmp(self, run_tmp: Path) -> None:
+        if run_tmp == self.cfg.local_snapshots_dir:
+            return
+        shutil.rmtree(run_tmp, ignore_errors=True)
 
     # -- snapshot / manifest discovery on the target ------------------
 
@@ -162,13 +230,25 @@ class BtrfsBackupEngine:
         state_dir: Optional[Path] = None
         local_snaps: Dict[str, str] = {}
 
-        # log to the USB snapshot dir if there is one, else next to /.snapshots
         try:
             self.cfg.local_snapshots_dir.mkdir(parents=True, exist_ok=True)
         except OSError:
             pass
-        logdir = self.cfg.local_snapshots_dir
-        self._logfile = open(logdir / f".backup-{compact}.log", "w", encoding="utf-8")
+        self._sweep_stale_tmp()
+
+        # Everything transient for this run lives under one pid-named dir so a
+        # hard kill leaves a single sweepable directory, not scattered files.
+        run_tmp = self._tmp_root / f"{os.getpid()}-{compact}"
+        try:
+            run_tmp.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            run_tmp = self.cfg.local_snapshots_dir      # best-effort fallback
+        atexit.register(self._cleanup_run_tmp, run_tmp)
+        try:
+            prev_sigterm = signal.signal(signal.SIGTERM, _raise_on_sigterm)
+        except (ValueError, OSError):
+            prev_sigterm = None                          # not the main thread
+        self._logfile = open(run_tmp / "backup.log", "w", encoding="utf-8")
 
         try:
             # 1. read-only local snapshots (shared by every target)
@@ -186,7 +266,7 @@ class BtrfsBackupEngine:
 
             # 2. system state (once)
             self._emit("stage", "System state (packages, config, restore.sh)")
-            state_dir = (self.cfg.local_snapshots_dir / f".state-{compact}")
+            state_dir = run_tmp / "state"
             state_dir.mkdir(parents=True, exist_ok=True)
             result.warnings += self._state_collector_cls(state_dir).collect_all()
             for w in result.warnings:
@@ -196,7 +276,7 @@ class BtrfsBackupEngine:
             if usb:
                 outcomes.append(("USB", self._backup_to_usb(name, local_snaps, state_dir, result)))
             if remote:
-                outcomes.append(("i7server", self._backup_to_remote(local_snaps, state_dir, result)))
+                outcomes.append(("i7server", self._backup_to_remote(name, local_snaps, state_dir, result)))
 
             ok = [t for t, s in outcomes if s == "completed"]
             bad = [f"{t}: {s}" for t, s in outcomes if s != "completed"]
@@ -225,11 +305,24 @@ class BtrfsBackupEngine:
             result.message = str(exc)
             self._emit("error", result.message)
         finally:
-            if state_dir and state_dir.exists():
-                shutil.rmtree(state_dir, ignore_errors=True)
+            if prev_sigterm is not None:
+                try:
+                    signal.signal(signal.SIGTERM, prev_sigterm)
+                except (ValueError, OSError):
+                    pass
             if self._logfile:
                 self._logfile.close()
                 self._logfile = None
+            # keep just the last run's log around for troubleshooting (one file,
+            # overwritten each run - no accumulation), then drop the scratch dir
+            try:
+                log = run_tmp / "backup.log"
+                if log.is_file():
+                    shutil.copy2(log, self.cfg.local_snapshots_dir / ".backup-last.log")
+            except OSError:
+                pass
+            atexit.unregister(self._cleanup_run_tmp)
+            self._cleanup_run_tmp(run_tmp)
         return result
 
     def _backup_to_usb(self, name: str, local_snaps: Dict[str, str],
@@ -282,8 +375,8 @@ class BtrfsBackupEngine:
                 pass
             return "partial" if isinstance(exc, CommandError) else "failed"
 
-    def _backup_to_remote(self, local_snaps: Dict[str, str], state_dir: Path,
-                          result: BackupResult) -> str:
+    def _backup_to_remote(self, name: str, local_snaps: Dict[str, str],
+                          state_dir: Path, result: BackupResult) -> str:
         user = self.cfg.user
         ssh = build_ssh_args(self.cfg, user)
         remote = f"{self.cfg.remote_user or user}@{self.cfg.remote_host}"
@@ -311,7 +404,7 @@ class BtrfsBackupEngine:
 
             # system state -> <base>/meta/<ts>/
             self._emit("stage", "i7server: system state")
-            self._push_state_remote(state_dir, ssh, remote, base)
+            self._push_state_remote(name, state_dir, ssh, remote, base)
             self._prune_remote(ssh, remote, base, result)
             return "completed"
         except CommandError as exc:
@@ -340,10 +433,11 @@ class BtrfsBackupEngine:
                 return local
         return None
 
-    def _push_state_remote(self, state_dir: Path, ssh, remote: str, base: str) -> None:
-        dest = f"{base}/meta/{state_dir.name.replace('.state-', '')}"
+    def _push_state_remote(self, name: str, state_dir: Path, ssh,
+                           remote: str, base: str) -> None:
+        dest = f"{base}/meta/{name}"
         try:
-            rc, err = self.ops.push_tree(state_dir, ssh, remote, dest)
+            rc, err = self.ops.push_tree(state_dir, ssh, remote, dest, timeout=120)
             if rc != 0:
                 self._emit("warning", f"i7server: system state not pushed: {err or rc}")
         except (OSError, subprocess.SubprocessError) as exc:
