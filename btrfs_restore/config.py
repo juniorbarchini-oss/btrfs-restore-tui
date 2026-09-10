@@ -67,11 +67,29 @@ DEFAULT_BTRFS_EXCLUSIONS = {
         "*/.local/share/Trash",
         "*/.thumbnails",
         "*/.mozilla/firefox/*/cache2",
-        "*/.config/google-chrome/*/Service Worker/CacheStorage",
-        "*/.config/google-chrome/*/Application Cache",
-        "*/.config/Code/Cache",
-        "*/.config/Code/CachedData",
         "*/.var/app/*/cache",
+        # Chromium family (Chrome, Chromium, Electron apps like VSCode): the
+        # per-profile *Cache dirs. `*` is a single path segment, so the two-star
+        # forms catch  ~/.config/google-chrome/<Profile>/Cache  and the one-star
+        # forms catch  ~/.config/<electron-app>/Cache .
+        "*/.config/*/*/Cache",
+        "*/.config/*/*/Code Cache",
+        "*/.config/*/*/GPUCache",
+        "*/.config/*/*/DawnCache",
+        "*/.config/*/*/DawnGraphiteCache",
+        "*/.config/*/*/DawnWebGPUCache",
+        "*/.config/*/*/GrShaderCache",
+        "*/.config/*/*/ShaderCache",
+        "*/.config/*/*/Service Worker/CacheStorage",
+        "*/.config/*/*/Service Worker/ScriptCache",
+        "*/.config/*/Cache",
+        "*/.config/*/CachedData",
+        "*/.config/*/Code Cache",
+        "*/.config/*/GPUCache",
+        "*/.config/*/GrShaderCache",
+        "*/.config/*/ShaderCache",
+        "*/.config/*/component_crx_cache",
+        "*/.config/*/DawnCache",
     ],
 }
 
