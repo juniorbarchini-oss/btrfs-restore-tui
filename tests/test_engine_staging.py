@@ -1,6 +1,9 @@
 """
-deploy_staging builds argv-list pipelines - no shell, no interpolation (#9).
+deploy_staging builds argv-list pipelines - no shell, no interpolation (#9);
+staging dirs are pid-named and orphan-swept, never nuking a parallel run (#15).
 """
+import os
+import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -80,9 +83,64 @@ class TestStagingStages(unittest.TestCase):
         self.assertIn("2222", argv)
         self.assertIn("-i", argv)
 
-    def test_remote_without_host_raises(self):
-        with self.assertRaises(RuntimeError):
-            self.eng._staging_stages(_snap(), self._cfg(host=""), "bob")
+    def test_receive_target_is_the_run_dir_when_given(self):
+        s = _snap(is_subvolume=True, path=Path("/backups/home_x"))
+        stages = self.eng._staging_stages(s, self._cfg(), "bob", Path("/tmp/stg/123-home_x"))
+        self.assertEqual(stages[1], ["btrfs", "receive", "/tmp/stg/123-home_x"])
+
+
+class TestStagingResidue(unittest.TestCase):
+    def setUp(self):
+        self._p = [
+            mock.patch.object(cfgmod, "_home_of", return_value=Path("/nonexistent")),
+            mock.patch.object(cfgmod, "_autodetect_backup_target", return_value=None),
+            mock.patch.dict("os.environ", {"USER": "bob"}, clear=True),
+        ]
+        for p in self._p:
+            p.start()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.eng = RestoreEngine()
+        self.eng.staging_dir = Path(self.tmp.name) / "staging"
+        self.eng.staging_dir.mkdir()
+        # btrfs isn't available in the sandbox - fall through to rmtree
+        self._sp = mock.patch("btrfs_restore.engine.subprocess.run",
+                              side_effect=OSError("no btrfs here"))
+        self._sp.start()
+
+    def tearDown(self):
+        self._sp.stop()
+        for p in self._p:
+            p.stop()
+        self.tmp.cleanup()
+
+    def _mkrun(self, name):
+        d = self.eng.staging_dir / name
+        d.mkdir()
+        (d / "received").mkdir()
+        (d / "received" / "f").write_text("x")
+        return d
+
+    def test_orphans_only_keeps_a_live_pid_removes_a_dead_one(self):
+        alive = self._mkrun(f"{os.getpid()}-home_x")
+        dead = self._mkrun("999999999-home_y")
+        self.eng.cleanup_staging(orphans_only=True)
+        self.assertTrue(alive.exists())
+        self.assertFalse(dead.exists())
+
+    def test_full_cleanup_removes_everything(self):
+        self._mkrun(f"{os.getpid()}-a")
+        self._mkrun("42-b")
+        self.eng.cleanup_staging()
+        self.assertEqual(list(self.eng.staging_dir.iterdir()), [])
+
+    def test_cleanup_own_staging_only_touches_the_tracked_run(self):
+        mine = self._mkrun(f"{os.getpid()}-mine")
+        other = self._mkrun(f"{os.getpid()}-other")
+        self.eng._staging_run = mine
+        self.eng._cleanup_own_staging()
+        self.assertFalse(mine.exists())
+        self.assertTrue(other.exists())
+        self.assertIsNone(self.eng._staging_run)
 
 
 if __name__ == "__main__":

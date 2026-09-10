@@ -354,16 +354,17 @@ class BtrfsRestoreApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        # Register atexit and signal handlers for foolproof staging cleanup
-        atexit.register(self.engine.cleanup_staging)
+        # Foolproof staging cleanup: our own run on exit/signal, dead-pid
+        # orphans (not a parallel run's) on startup.
+        atexit.register(self.engine._cleanup_own_staging)
         try:
-            signal.signal(signal.SIGTERM, lambda s, f: (self.engine.cleanup_staging(), self.exit()))
-            signal.signal(signal.SIGHUP, lambda s, f: (self.engine.cleanup_staging(), self.exit()))
+            signal.signal(signal.SIGTERM, lambda s, f: (self.engine._cleanup_own_staging(), self.exit()))
+            signal.signal(signal.SIGHUP, lambda s, f: (self.engine._cleanup_own_staging(), self.exit()))
         except Exception:
             pass
 
-        # Purge any leftover staging subvolume on startup
-        self.engine.cleanup_staging()
+        # Purge staging left by dead runs on startup (keep a parallel run's)
+        self.engine.cleanup_staging(orphans_only=True)
         self.refresh_snapshots()
 
     def refresh_snapshots(self) -> None:
@@ -770,9 +771,9 @@ class BtrfsRestoreApp(App):
             self.action_quit_app()
 
     def on_unmount(self) -> None:
-        """Cleanup staging subvolume on exit."""
+        """Cleanup this run's staging subvolume on exit."""
         try:
-            self.engine.cleanup_staging()
+            self.engine._cleanup_own_staging()
         except Exception:
             pass
 
