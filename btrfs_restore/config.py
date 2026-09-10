@@ -46,6 +46,35 @@ DEFAULT_LOCAL_KEEP = 10
 # Subvolumes captured by `backup-now`. Mount points, not subvol names.
 DEFAULT_SOURCE_MOUNTS = ["/", "/home"]
 
+# Paths dropped from each source subvolume before it is sent - throwaway caches,
+# trash and crash dumps that only bloat the incremental delta. `btrfs send`
+# cannot skip paths mid-stream, so the engine snapshots the subvolume writable,
+# deletes these, then flips the snapshot read-only and sends that.
+# Keys are source mount points; values are globs relative to that mount.
+# Extra entries come from EXCLUDE= lines in the config file; EXCLUDE_DEFAULTS=off
+# drops this built-in list.
+DEFAULT_BTRFS_EXCLUSIONS = {
+    # Kept deliberately narrow: never a directory that holds a nested subvolume
+    # mount point (e.g. /var/cache/pacman/pkg, /var/log are already their own
+    # subvolumes on Omarchy and drop out of `btrfs send` on their own).
+    "/": [
+        "var/tmp/*",
+        "var/crash/*",
+        "var/lib/systemd/coredump/*",
+    ],
+    "/home": [
+        "*/.cache",
+        "*/.local/share/Trash",
+        "*/.thumbnails",
+        "*/.mozilla/firefox/*/cache2",
+        "*/.config/google-chrome/*/Service Worker/CacheStorage",
+        "*/.config/google-chrome/*/Application Cache",
+        "*/.config/Code/Cache",
+        "*/.config/Code/CachedData",
+        "*/.var/app/*/cache",
+    ],
+}
+
 # Where read-only local snapshots are created / looked for.
 DEFAULT_LOCAL_SNAPSHOTS_DIR = Path("/.snapshots")
 
@@ -156,6 +185,10 @@ class Config:
     local_snapshots_dir: Path = DEFAULT_LOCAL_SNAPSHOTS_DIR
     staging_dir: Optional[Path] = None            # resolved; None -> engine detects
 
+    # -- what to leave out of the backup (caches, trash) ---------------
+    exclude_defaults: bool = True
+    extra_exclusions: List[str] = field(default_factory=list)
+
     # -- backup target (USB / dir) ------------------------------------
     target_root: Optional[Path] = None           # <mount>/btrfs-restore  (resolved)
 
@@ -241,6 +274,15 @@ class Config:
         if cap is not None:
             cfg.max_snapshots = cap
 
+        # --- exclusions --------------------------------------------
+        ed = _env("EXCLUDE_DEFAULTS") or fv.get("EXCLUDE_DEFAULTS")
+        if ed is not None and str(ed).strip().lower() in ("0", "off", "false", "no"):
+            cfg.exclude_defaults = False
+        cfg.extra_exclusions = list(fv.get("_EXCLUDES", []))
+        env_excl = _env("EXCLUDE")
+        if env_excl:
+            cfg.extra_exclusions += [p.strip() for p in env_excl.split(":") if p.strip()]
+
         # --- remote --------------------------------------------------
         cfg.remote_host = _env("REMOTE_HOST") or fv.get("REMOTE_HOST", "")
         cfg.remote_path = _env("REMOTE_PATH") or fv.get("REMOTE_PATH", "")
@@ -256,6 +298,17 @@ class Config:
         return cfg
 
     # -- helpers ------------------------------------------------------
+    def exclusions_for(self, mount: str) -> List[str]:
+        """Globs (relative to `mount`) to delete from that subvolume's snapshot
+        before it is sent. Built-in list for the mount (unless disabled) plus
+        any EXCLUDE= extras, de-duplicated, order preserved."""
+        pats: List[str] = []
+        if self.exclude_defaults:
+            pats += DEFAULT_BTRFS_EXCLUSIONS.get(mount, [])
+        pats += self.extra_exclusions
+        seen: set = set()
+        return [p for p in pats if not (p in seen or seen.add(p))]
+
     def target_is_btrfs(self) -> Optional[bool]:
         """True/False if the target FS type could be determined, else None."""
         if not self.target_root:
@@ -329,6 +382,8 @@ def _dump() -> None:
         ("latest link", str(cfg.latest_link) if cfg.latest_link else "-"),
         ("retention", f"max_disk={cfg.max_disk_percent}%  min_keep={cfg.min_keep}  "
                       f"max_snapshots={cfg.max_snapshots or 'off'}  local_keep={cfg.local_keep}"),
+        ("exclusions", f"defaults {'on' if cfg.exclude_defaults else 'off'}"
+                       + (f" + {len(cfg.extra_exclusions)} custom" if cfg.extra_exclusions else "")),
         ("remote", f"{cfg.remote_name}  {cfg.remote_user}@{cfg.remote_host or '(none)'}:{cfg.remote_path or ''}  port {cfg.remote_port}"),
     ]
     width = max(len(k) for k, _ in rows)
