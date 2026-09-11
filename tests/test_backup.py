@@ -8,6 +8,7 @@ and failure points are configurable.
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -353,6 +354,27 @@ class TestBackupRemote(BackupTestBase):
         finally:
             _os.unlink(path)
 
+    def test_state_dir_still_has_content_for_remote_after_usb_runs_first(self):
+        """Real-hardware finding: with USB + remote both configured, USB used
+        to MOVE the shared state_dir's contents into its own snapshot dir,
+        leaving nothing for the remote push that runs right after - meta/<name>/
+        landed empty with no error (push_tree of an empty dir "succeeds")."""
+        cfg = self._remote_cfg(with_usb=True)
+        ops = FakeBtrfsOps(target_is_btrfs=True)
+        r = BtrfsBackupEngine(cfg, ops=ops).run()
+        self.assertEqual(r.status, "completed", r.message)
+
+        # USB snapshot still got its own copy of the state
+        snap = cfg.snapshots_dir / r.snapshot_name
+        self.assertTrue((snap / "_system_state" / "os_info.json").exists())
+
+        # AND the remote meta/<name>/ push actually carried files, not an
+        # empty tar
+        meta_push = next((files for dest, files in ops.pushed_trees
+                          if dest.rstrip("/").endswith(f"meta/{r.snapshot_name}")), None)
+        self.assertIsNotNone(meta_push, "no push to meta/<name>/ was recorded")
+        self.assertIn("_system_state/os_info.json", meta_push)
+
     def test_no_target_at_all_fails(self):
         cfg = self.make_cfg()
         cfg.target_root = None
@@ -457,6 +479,23 @@ class TestRecoveryKit(BackupTestBase):
         # the script parses without a shell error
         import subprocess as sp
         self.assertEqual(sp.run(["bash", "-n", str(dr)]).returncode, 0)
+
+
+class TestRemoteRecoveryKitSnapshotFilter(unittest.TestCase):
+    """Real-hardware finding: an old AGY backup script also drops flat files
+    into meta/ (dellomar_boot_*.tar.zst, disk_layout_*.txt, pkglist_*.txt,
+    *.sfdisk) alongside the real meta/<name>/ directories. The remote
+    disaster-recovery.sh's snapshot picker listed those as bogus choices."""
+
+    def test_picker_only_lists_date_named_directories(self):
+        from btrfs_restore.backup import _DISASTER_RECOVERY_REMOTE_SH as script
+        self.assertIn("-type d", script)  # directories only, not the flat files
+        self.assertIn(r"[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{6}", script)  # date-shaped names only
+        filled = (script.replace("@@HOST@@", "bob@host")
+                        .replace("@@BASE@@", "/srv/backups")
+                        .replace("@@PORT@@", "22"))
+        r = subprocess.run(["bash", "-n"], input=filled, text=True, capture_output=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
 
 
 class TestBackupScratchCleanup(BackupTestBase):

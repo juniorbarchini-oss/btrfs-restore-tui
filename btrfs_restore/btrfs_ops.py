@@ -319,7 +319,14 @@ class BtrfsOps:
                   remote: str, remote_dir: str, timeout: int = 120) -> tuple:
         """tar the local dir and untar it into remote_dir over ssh, giving up
         after `timeout` seconds so a stalled link (Tailscale hiccup) can't hang
-        the whole backup. Returns (returncode, stderr_text); 124 == timed out."""
+        the whole backup. Returns (returncode, stderr_text); 124 == timed out.
+
+        A missing or empty `local_dir` is reported as an error rather than a
+        silent no-op success - an empty tar stream still extracts "successfully"
+        on the receiving end, which used to hide the caller sending nothing."""
+        local_dir = Path(local_dir)
+        if not local_dir.is_dir() or not any(local_dir.iterdir()):
+            return 1, f"nothing to push: {local_dir} is missing or empty"
         try:
             mk = subprocess.run([*ssh_argv, remote, "mkdir", "-p", remote_dir],
                                 capture_output=True, text=True, timeout=30)
@@ -345,4 +352,8 @@ class BtrfsOps:
             _kill_process_group((recv, tar))
             raise
         tar.wait()
+        if tar.returncode != 0:
+            tar_err = (tar.stderr.read() or b"").decode("utf-8", "replace").strip() \
+                if tar.stderr else ""
+            return tar.returncode, tar_err or "local tar failed"
         return recv.returncode, (err.decode("utf-8", "replace").strip() if err else "")
