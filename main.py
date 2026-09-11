@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Main entry point for Btrfs Restore TUI (AGY Time Explorer).
+Main entry point for Btrfs Restore TUI.
 Automatically elevates privileges with sudo to manage Btrfs operations seamlessly.
 """
 import os

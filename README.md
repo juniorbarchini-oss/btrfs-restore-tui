@@ -1,4 +1,4 @@
-# Btrfs Restore TUI (AGY Time Machine)
+# Btrfs Restore TUI
 
 > **One terminal app for Btrfs backup *and* granular restore.** A retro
 > phosphor-green TUI to browse and recover individual files/folders from local,
@@ -187,7 +187,7 @@ sudo ./install.sh          # -> /opt/btrfs-restore-tui, symlinks in /usr/local/b
 `install.sh` builds a self-contained `/opt/btrfs-restore-tui/.venv` with
 `textual` + `rich` (falling back to system Python only if `venv` is
 unavailable), installs `sshfs` when missing, and retires a pre-existing loose
-`~/.local/bin/backup-now` (the AGY script this engine replaces) — archiving a
+`~/.local/bin/backup-now` (the old ad-hoc script this engine replaces) — archiving a
 copy to `~/.config/btrfs-restore/legacy-backup-now.sh.bak` and taking it off
 `PATH`.
 
@@ -211,4 +211,4 @@ test that exercises real `btrfs send`/`receive`.
 
 ## 8. License
 
-MIT. Part of the AGY ecosystem.
+MIT.

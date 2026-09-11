@@ -327,7 +327,7 @@ class BtrfsRestoreApp(App):
     """Main Btrfs Restore TUI application."""
 
     CSS = RETRO_CSS
-    TITLE = "Btrfs Restore TUI (AGY Time Explorer)"
+    TITLE = "Btrfs Restore TUI"
     BINDINGS = [
         Binding("space", "toggle_select", "Select/Unselect", priority=True),
         Binding("r", "restore_original", "Restore Original"),
