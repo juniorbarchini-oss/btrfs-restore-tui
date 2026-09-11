@@ -482,7 +482,7 @@ class TestRecoveryKit(BackupTestBase):
 
 
 class TestRemoteRecoveryKitSnapshotFilter(unittest.TestCase):
-    """Real-hardware finding: an old AGY backup script also drops flat files
+    """Real-hardware finding: an old ad-hoc backup script also drops flat files
     into meta/ (dellomar_boot_*.tar.zst, disk_layout_*.txt, pkglist_*.txt,
     *.sfdisk) alongside the real meta/<name>/ directories. The remote
     disaster-recovery.sh's snapshot picker listed those as bogus choices."""
