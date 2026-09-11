@@ -903,7 +903,9 @@ done
 echo "Backup host : ${HOST}:${BASE}"
 # -n on every standalone ssh: without it ssh swallows this script's stdin and
 # the `read` prompts below get EOF. (rsync manages its own ssh, leave that one.)
-mapfile -t NAMES < <(ssh -n "${SSH_OPTS[@]}" "${HOST}" "ls -1 ${BASE}/meta 2>/dev/null" | sort -r)
+mapfile -t NAMES < <(ssh -n "${SSH_OPTS[@]}" "${HOST}" \
+    "find ${BASE}/meta -mindepth 1 -maxdepth 1 -type d -printf '%f\\n' 2>/dev/null" \
+    | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{6}$' | sort -r)
 [ "${#NAMES[@]}" -gt 0 ] || { echo "no snapshots under ${HOST}:${BASE}/meta"; exit 1; }
 
 echo "Snapshots on the host (newest first):"
