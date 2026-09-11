@@ -353,6 +353,27 @@ class TestBackupRemote(BackupTestBase):
         finally:
             _os.unlink(path)
 
+    def test_state_dir_still_has_content_for_remote_after_usb_runs_first(self):
+        """Real-hardware finding: with USB + remote both configured, USB used
+        to MOVE the shared state_dir's contents into its own snapshot dir,
+        leaving nothing for the remote push that runs right after - meta/<name>/
+        landed empty with no error (push_tree of an empty dir "succeeds")."""
+        cfg = self._remote_cfg(with_usb=True)
+        ops = FakeBtrfsOps(target_is_btrfs=True)
+        r = BtrfsBackupEngine(cfg, ops=ops).run()
+        self.assertEqual(r.status, "completed", r.message)
+
+        # USB snapshot still got its own copy of the state
+        snap = cfg.snapshots_dir / r.snapshot_name
+        self.assertTrue((snap / "_system_state" / "os_info.json").exists())
+
+        # AND the remote meta/<name>/ push actually carried files, not an
+        # empty tar
+        meta_push = next((files for dest, files in ops.pushed_trees
+                          if dest.rstrip("/").endswith(f"meta/{r.snapshot_name}")), None)
+        self.assertIsNotNone(meta_push, "no push to meta/<name>/ was recorded")
+        self.assertIn("_system_state/os_info.json", meta_push)
+
     def test_no_target_at_all_fails(self):
         cfg = self.make_cfg()
         cfg.target_root = None

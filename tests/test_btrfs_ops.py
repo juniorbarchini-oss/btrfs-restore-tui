@@ -128,6 +128,27 @@ class TestPushTreeTimeout(unittest.TestCase):
         self.assertEqual(rc, 124)
         self.assertIn("timed out", err)
 
+    def test_empty_local_dir_is_an_error_not_a_silent_success(self):
+        """An empty tar stream still extracts "successfully" on the receiving
+        end - push_tree must not report rc=0 when there was nothing to send
+        (real-hardware finding: a shared state dir emptied by an earlier
+        caller made this look like a successful, silent no-op)."""
+        with tempfile.TemporaryDirectory() as d:
+            empty = Path(d) / "empty"
+            empty.mkdir()
+            ops = BtrfsOps()
+            rc, err = ops.push_tree(empty, ["true"], "remote", str(Path(d) / "dest"))
+        self.assertNotEqual(rc, 0)
+        self.assertIn("empty", err)
+
+    def test_missing_local_dir_is_an_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            ops = BtrfsOps()
+            rc, err = ops.push_tree(Path(d) / "nope", ["true"], "remote",
+                                    str(Path(d) / "dest"))
+        self.assertNotEqual(rc, 0)
+        self.assertIn("missing", err)
+
 
 class TestHuman(unittest.TestCase):
     def test_units(self):
