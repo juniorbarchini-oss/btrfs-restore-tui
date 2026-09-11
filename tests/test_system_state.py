@@ -38,6 +38,53 @@ class TestSystemState(unittest.TestCase):
                             capture_output=True, text=True)
         self.assertEqual(rc.returncode, 0, rc.stderr)
 
+    def test_explicit_pkglist_excludes_aur_packages(self):
+        """pacman -Qqe lists AUR/foreign packages too (they're also "explicit") -
+        pkglist_explicit.txt must hold repo-only names so restore.sh's plain
+        `pacman -S` never hits "target not found" on an AUR-only name (#16
+        real-hardware finding)."""
+        def fake_run(cmd, capture_output=True, text=True, timeout=60):
+            if cmd[:2] == ["pacman", "-Qqm"]:
+                out = "yay\nclaude-desktop-extra\n"
+            elif cmd[:2] == ["pacman", "-Qqe"]:
+                out = "yay\nclaude-desktop-extra\ngit\nfirefox\n"
+            else:
+                out = ""
+            return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+
+        c = SystemStateCollector(self.snap)
+        c.meta_dir.mkdir(parents=True, exist_ok=True)
+        with mock.patch("btrfs_restore.system_state.shutil.which", return_value="/usr/bin/pacman"), \
+             mock.patch("btrfs_restore.system_state.subprocess.run", side_effect=fake_run):
+            c._export_packages()
+
+        explicit = (self.snap / "_system_state" / "pkglist_explicit.txt").read_text().split()
+        aur = (self.snap / "_system_state" / "pkglist_aur.txt").read_text().split()
+        self.assertEqual(sorted(explicit), ["firefox", "git"])
+        self.assertIn("yay", aur)
+        self.assertIn("claude-desktop-extra", aur)
+        # never in both - restore.sh would otherwise try `pacman -S` on an AUR name
+        self.assertFalse(set(explicit) & set(aur))
+
+    def test_restore_script_bypasses_omarchy_update_guard(self):
+        """Omarchy's 00-omarchy-update-guard.hook refuses a direct `pacman -Syu`
+        (real-hardware finding on the bare-metal recovery test) - restore.sh
+        must opt back in for that one call, detected at runtime."""
+        SystemStateCollector(self.snap).collect_all()
+        body = (self.snap / "restore.sh").read_text()
+        self.assertIn("OMARCHY_ALLOW_DIRECT_PACMAN=1", body)
+        self.assertIn("command -v omarchy", body)
+
+    def test_restore_script_aur_helper_is_noninteractive(self):
+        """yay/paru must never reach for a tty during an unattended recovery
+        (real-hardware finding: yay died with "open /dev/tty")."""
+        SystemStateCollector(self.snap).collect_all()
+        body = (self.snap / "restore.sh").read_text()
+        self.assertIn("--answerclean None", body)
+        self.assertIn("--answerdiff None", body)
+        self.assertIn("--skipreview", body)  # paru
+        self.assertIn("retry manually", body)
+
     def test_restore_script_self_elevates_for_the_home_step(self):
         SystemStateCollector(self.snap).collect_all()
         body = (self.snap / "restore.sh").read_text()
