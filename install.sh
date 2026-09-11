@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# System installer for Btrfs Restore TUI (AGY Time Machine)
+# System installer for Btrfs Restore TUI
 # Deploys to /opt/btrfs-restore-tui with global commands in /usr/local/bin,
 # and builds a self-contained Python venv there so the app never depends on
 # system-wide site-packages. If the venv can't be built (no network, no venv
@@ -27,7 +27,7 @@ fi
 
 echo "=== Installing ${APP_NAME} ==="
 
-# Retire the loose pre-app backup-now script (AGY, ~/.local/bin, unversioned):
+# Retire the loose pre-app backup-now script (~/.local/bin, unversioned):
 # archive a copy next to the user config, then take it off PATH so the app's
 # own command is the only backup-now.
 LEGACY="${REAL_HOME}/.local/bin/backup-now"
@@ -117,7 +117,7 @@ cat > "${DESKTOP_ENTRY}" << 'EOF'
 [Desktop Entry]
 Type=Application
 Name=Btrfs Restore TUI
-Comment=AGY Time Machine - Btrfs backup and granular restore
+Comment=Btrfs backup and granular restore
 Exec=foot --title="Btrfs Restore TUI" restore-tui
 Icon=drive-harddisk
 Terminal=false

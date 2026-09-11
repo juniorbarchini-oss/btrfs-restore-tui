@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Uninstaller for Btrfs Restore TUI (AGY Time Machine)
+# Uninstaller for Btrfs Restore TUI
 #
 # Removes everything install.sh put on the machine. Leaves user config and your
 # backup snapshots alone unless you explicitly confirm.
@@ -77,7 +77,7 @@ if [ "${PURGE}" -eq 1 ] || _ask "Also remove user config in ${REAL_HOME}/.config
     echo "    removed user config"
 fi
 
-# 4. legacy AGY backup-now script
+# 4. legacy backup-now script
 LEGACY="${REAL_HOME}/.local/bin/backup-now"
 if [ -f "${LEGACY}" ] && { [ "${PURGE}" -eq 1 ] || _ask "Remove the legacy script ${LEGACY} ?"; }; then
     rm -f "${LEGACY}"
