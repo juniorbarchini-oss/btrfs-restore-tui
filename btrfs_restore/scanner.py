@@ -50,7 +50,14 @@ class SnapshotScanner:
             if entry.name == "home_parent":
                 user_home_dir = entry / self.user
                 target_path = user_home_dir if user_home_dir.exists() else entry
-                stat = entry.stat()
+                try:
+                    stat = entry.stat()
+                except (FileNotFoundError, OSError):
+                    logger.warning(
+                        "Skipping home_parent: symlink is broken or was re-pointed "
+                        "by a concurrent backup run"
+                    )
+                    continue
                 snap_time = max(
                     datetime.fromtimestamp(stat.st_mtime),
                     datetime.fromtimestamp(stat.st_ctime),
@@ -69,7 +76,14 @@ class SnapshotScanner:
 
             # 2. root_parent
             elif entry.name == "root_parent":
-                stat = entry.stat()
+                try:
+                    stat = entry.stat()
+                except (FileNotFoundError, OSError):
+                    logger.warning(
+                        "Skipping root_parent: symlink is broken or was re-pointed "
+                        "by a concurrent backup run"
+                    )
+                    continue
                 snap_time = max(
                     datetime.fromtimestamp(stat.st_mtime),
                     datetime.fromtimestamp(stat.st_ctime),
