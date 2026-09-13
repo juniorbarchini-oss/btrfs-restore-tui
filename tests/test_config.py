@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from btrfs_restore import config as cfgmod
-from btrfs_restore.config import Config, BACKUP_DIRNAME
+from btrfs_restore.config import Config, BACKUP_DIRNAME, list_backup_drives, save_user_settings
 
 
 class TestConfig(unittest.TestCase):
@@ -131,6 +131,89 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(Config.load().max_disk_percent, 10)  # floor
         self.cfg_file.write_text("MAX_DISK_PERCENT=150\n")
         self.assertEqual(Config.load().max_disk_percent, 99)  # ceil
+
+
+class TestSettingsScreen(unittest.TestCase):
+    """The Settings screen's write path (config.py) and drive listing -
+    the Textual widgets themselves are covered in test_settings_ui.py."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        (self.home / ".config" / "restore-tui").mkdir(parents=True)
+        self.cfg_file = self.home / ".config" / "restore-tui" / "config.conf"
+        self._patchers = [
+            mock.patch.object(cfgmod, "_home_of", return_value=self.home),
+            mock.patch.object(cfgmod, "_current_user", return_value="tester"),
+            mock.patch.dict(os.environ, {}, clear=True),
+        ]
+        for p in self._patchers:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patchers:
+            p.stop()
+        self.tmp.cleanup()
+
+    def test_save_creates_file_with_updates(self):
+        path = save_user_settings({"TARGET_DIR": "/mnt/usb", "REMOTE_HOST": ""})
+        self.assertEqual(path, self.cfg_file)
+        text = self.cfg_file.read_text()
+        self.assertIn("TARGET_DIR=/mnt/usb", text)
+        self.assertIn("REMOTE_HOST=", text)
+
+    def test_save_preserves_untouched_lines_and_comments(self):
+        self.cfg_file.write_text(
+            "# my notes\n"
+            "MAX_DISK_PERCENT=70\n"
+            "EXCLUDE=Downloads/big/\n"
+            "TARGET_DIR=/mnt/old\n"
+        )
+        save_user_settings({"TARGET_DIR": "/mnt/new"})
+        lines = self.cfg_file.read_text().splitlines()
+        self.assertIn("# my notes", lines)
+        self.assertIn("MAX_DISK_PERCENT=70", lines)
+        self.assertIn("EXCLUDE=Downloads/big/", lines)
+        self.assertIn("TARGET_DIR=/mnt/new", lines)
+        self.assertNotIn("TARGET_DIR=/mnt/old", lines)
+        # rewritten key stays on one line, no duplicate
+        self.assertEqual(sum(1 for l in lines if l.startswith("TARGET_DIR=")), 1)
+
+    def test_save_round_trips_through_config_load(self):
+        save_user_settings({
+            "TARGET_DIR": "/mnt/pinned",
+            "REMOTE_HOST": "10.0.0.9",
+            "REMOTE_USER": "hbarchini",
+            "REMOTE_PATH": "/backups",
+            "REMOTE_PORT": "2222",
+            "REMOTE_NAME": "nas",
+        })
+        with mock.patch.object(cfgmod, "_autodetect_backup_target", return_value=None):
+            cfg = Config.load()
+        self.assertEqual(cfg.target_root, Path("/mnt/pinned") / BACKUP_DIRNAME)
+        self.assertEqual(cfg.remote_host, "10.0.0.9")
+        self.assertEqual(cfg.remote_port, 2222)
+        self.assertEqual(cfg.remote_name, "nas")
+
+    def test_save_empty_target_dir_falls_back_to_autodetect(self):
+        self.cfg_file.write_text("TARGET_DIR=/mnt/old\n")
+        save_user_settings({"TARGET_DIR": ""})
+        with mock.patch.object(cfgmod, "_autodetect_backup_target", return_value="/mnt/detected"):
+            cfg = Config.load()
+        self.assertEqual(cfg.target_root, Path("/mnt/detected") / BACKUP_DIRNAME)
+
+    def test_list_backup_drives_reports_fstype(self):
+        media = self.home  # any writable dir stands in for a mount base
+        fake_base = Path(self.tmp.name) / "media_base"
+        (fake_base / "USB1").mkdir(parents=True)
+        with mock.patch.object(cfgmod, "_candidate_drives", return_value=[fake_base / "USB1"]), \
+             mock.patch.object(cfgmod, "_fstype_of", return_value="ext4"):
+            drives = list_backup_drives("tester")
+        self.assertEqual(drives, [(fake_base / "USB1", "ext4")])
+
+    def test_list_backup_drives_empty_when_none_connected(self):
+        with mock.patch.object(cfgmod, "_candidate_drives", return_value=[]):
+            self.assertEqual(list_backup_drives("tester"), [])
 
 
 if __name__ == "__main__":
