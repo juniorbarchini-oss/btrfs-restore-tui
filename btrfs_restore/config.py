@@ -20,7 +20,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Set, Tuple
 
 logger = logging.getLogger("btrfs_restore")
 
@@ -95,6 +95,12 @@ DEFAULT_BTRFS_EXCLUSIONS = {
 
 # Where read-only local snapshots are created / looked for.
 DEFAULT_LOCAL_SNAPSHOTS_DIR = Path("/.snapshots")
+
+# Filesystems the backup engine can actually write a target to: btrfs (native
+# subvolumes) or ext4 (falls back to a streamed .btrfs.zst image, see
+# Config.target_is_btrfs). Used only to hint the Settings screen - never
+# enforced, since formatting a drive is out of scope for this app.
+SUPPORTED_TARGET_FSTYPES = {"btrfs", "ext4"}
 
 _ENV_PREFIX = "RESTORE_TUI_"
 
@@ -352,6 +358,33 @@ def _fstype_of(path: Path) -> Optional[str]:
         return None
 
 
+def _candidate_drives(user: str) -> List[Path]:
+    """Every writable removable-media mount currently visible."""
+    bases = [Path(f"/run/media/{user}"), Path(f"/media/{user}"), Path("/mnt")]
+    seen: Set[Path] = set()
+    candidates: List[Path] = []
+    for base in bases:
+        try:
+            if not base.is_dir():
+                continue
+            for entry in sorted(base.iterdir()):
+                if entry in seen:
+                    continue
+                if entry.is_dir() and os.access(entry, os.W_OK):
+                    seen.add(entry)
+                    candidates.append(entry)
+        except OSError:
+            continue
+    return candidates
+
+
+def list_backup_drives(user: Optional[str] = None) -> List[Tuple[Path, Optional[str]]]:
+    """Every writable removable-media mount, paired with its filesystem type
+    (None if it couldn't be determined). Used by the Settings screen so the
+    user can pick a backup destination without hand-editing config.conf."""
+    return [(d, _fstype_of(d)) for d in _candidate_drives(user or _current_user())]
+
+
 def _autodetect_backup_target(user: str) -> Optional[str]:
     """Pick a removable-media mount to back up to.
 
@@ -359,18 +392,7 @@ def _autodetect_backup_target(user: str) -> Optional[str]:
     labelled USB_BTRFS (the btrfs half of Humberto's USB) > the first writable
     removable mount found.
     """
-    bases = [Path(f"/run/media/{user}"), Path(f"/media/{user}"), Path("/mnt")]
-    candidates: List[Path] = []
-    for base in bases:
-        try:
-            if not base.is_dir():
-                continue
-            for entry in sorted(base.iterdir()):
-                if entry.is_dir() and os.access(entry, os.W_OK):
-                    candidates.append(entry)
-        except OSError:
-            continue
-
+    candidates = _candidate_drives(user)
     if not candidates:
         return None
 
@@ -381,6 +403,55 @@ def _autodetect_backup_target(user: str) -> Optional[str]:
         if drive.name.upper() in ("USB_BTRFS", "USB_DATA"):
             return str(drive)
     return str(candidates[0])
+
+
+def _settings_file_path(user: str) -> Path:
+    """The config file the Settings screen reads/writes: the first existing
+    candidate, else the canonical `~/.config/restore-tui/config.conf`."""
+    for path in _config_candidates(user):
+        if path.is_file():
+            return path
+    return _config_candidates(user)[0]
+
+
+def save_user_settings(updates: dict) -> Path:
+    """Persist `{CANONICAL_KEY: value}` into the user's config file, in place.
+
+    Existing lines (comments, EXCLUDE=, unrelated keys) are left untouched;
+    a matched key is rewritten on its own line, and any key not already
+    present is appended under a marker comment. This is the one place this
+    program writes to config.conf - everywhere else it is read-only, per the
+    module docstring.
+    """
+    user = _current_user()
+    path = _settings_file_path(user)
+
+    lines = path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
+    remaining = dict(updates)
+    out_lines: List[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            key = stripped.split("=", 1)[0].strip().upper()
+            if key in remaining:
+                out_lines.append(f"{key}={remaining.pop(key)}")
+                continue
+        out_lines.append(line)
+
+    if remaining:
+        if out_lines and out_lines[-1].strip():
+            out_lines.append("")
+        out_lines.append("# --- written by the Settings screen ---")
+        for key, val in remaining.items():
+            out_lines.append(f"{key}={val}")
+
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+    return path
 
 
 def _dump() -> None:

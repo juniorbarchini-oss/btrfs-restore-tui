@@ -210,4 +210,64 @@ ProgressBar > .bar--bar {
 ProgressBar > .bar--complete {
     color: #FFFF00;
 }
+
+/* Settings screen: form sections, radio/checkbox lists */
+.settings-section {
+    color: #FFFF00;
+    text-style: bold;
+    margin-top: 1;
+    border-bottom: solid #00FF66;
+}
+
+.settings-hint {
+    color: #666666;
+    margin-bottom: 1;
+}
+
+RadioSet {
+    background: #000000;
+    color: #00FF66;
+    border: round #00FF66;
+}
+
+RadioSet:focus > RadioButton.-selected {
+    background: #003311;
+}
+
+RadioButton {
+    color: #00FF66;
+}
+
+Checkbox {
+    background: #000000;
+    color: #00FF66;
+    border: round #00FF66;
+}
+
+Checkbox:focus {
+    border: round #FFFF00;
+}
+
+#settings-remote-fields Input {
+    background: #001100;
+    color: #00FF66;
+    border: round #00FF66;
+    margin-bottom: 1;
+}
+
+#settings-remote-fields Input:focus {
+    border: round #FFFF00;
+}
+
+#settings-remote-fields.disabled Input {
+    color: #666666;
+    border: round #333333;
+}
+
+#settings-status {
+    color: #FFFF00;
+    text-style: bold;
+    margin-top: 1;
+    height: auto;
+}
 """

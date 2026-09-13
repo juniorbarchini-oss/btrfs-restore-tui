@@ -4,12 +4,14 @@
     [B]  Backup now
     [R]  Restore files / folders
     [F]  Full recovery (freshly installed machine)
+    [S]  Settings (backup destination, SSH remote)
     [Q]  Quit
 
 `restore-tui backup [...]` and `restore-tui restore` jump straight into a mode
 (so do the `backup-now` / `restore-now` aliases). Privilege elevation is
 deferred: the menu and status run unprivileged; picking Backup or Restore
-re-execs that one command under sudo.
+re-execs that one command under sudo. Settings runs unprivileged always - it
+only edits the user's own config.conf.
 """
 import os
 import subprocess
@@ -54,6 +56,17 @@ def _run_restore() -> int:
     return _run_mode(str(_PKG_ROOT / "main.py"))
 
 
+def _run_settings() -> int:
+    """Settings needs no root - it only reads mount info and writes the
+    user's own config file - so it runs directly, without _run_mode's sudo
+    re-exec."""
+    os.environ["PYTHONPATH"] = f"{_PKG_ROOT}:{os.environ.get('PYTHONPATH', '')}".rstrip(":")
+    try:
+        return subprocess.run([sys.executable, "-m", "btrfs_restore.settings_ui"]).returncode
+    except KeyboardInterrupt:
+        return 130
+
+
 def _show_recovery_info():
     cfg = Config.load()
     loc = cfg.target_root or "(USB not mounted / TARGET_DIR unset)"
@@ -86,6 +99,7 @@ def _print_menu():
     header.append("   [B]  Backup now\n", style="#00FF66")
     header.append("   [R]  Restore files / folders\n", style="#00FF66")
     header.append("   [F]  Full recovery (freshly installed machine)\n", style="#00FF66")
+    header.append("   [S]  Settings (backup destination, SSH remote)\n", style="#00FF66")
     header.append("   [Q]  Quit", style="#00FF66")
     console.print(Panel(header, border_style="#00FF66"))
 
@@ -159,6 +173,10 @@ def _menu() -> int:
             _print_menu()
         elif choice in ("f", "full"):
             _show_recovery_info()
+        elif choice in ("s", "settings"):
+            _run_settings()
+            console.print()
+            _print_menu()
         elif choice in ("q", "quit", "salir", ""):
             return 0
         else:
@@ -171,6 +189,8 @@ def main() -> None:
         sys.exit(_run_backup(args[1:]))
     elif args and args[0] in ("restore", "restore-now"):
         sys.exit(_run_restore())
+    elif args and args[0] == "settings":
+        sys.exit(_run_settings())
     elif args and args[0] == "--gc":
         sys.exit(_gc())
     elif args and args[0] == "--paths":
