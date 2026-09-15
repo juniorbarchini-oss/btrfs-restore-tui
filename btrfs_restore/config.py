@@ -382,7 +382,8 @@ def _candidate_drives(user: str) -> List[Path]:
             for entry in sorted(base.iterdir()):
                 if entry in seen:
                     continue
-                if entry.is_dir() and os.access(entry, os.W_OK):
+                if (entry.is_dir() and os.access(entry, os.W_OK)
+                        and os.path.ismount(entry)):
                     seen.add(entry)
                     candidates.append(entry)
         except OSError:

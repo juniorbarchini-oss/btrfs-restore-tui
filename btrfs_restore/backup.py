@@ -543,6 +543,13 @@ class BtrfsBackupEngine:
 
     def _target_writable(self) -> bool:
         root = self.cfg.target_root
+        # `root` is `<usb-mount>/btrfs-restore` - the mount point is its
+        # parent. A stale mountpoint directory left over after the drive was
+        # unplugged is still a perfectly writable directory on the root
+        # filesystem, so writability alone is not enough: without this check
+        # a backup silently lands on / instead of failing loudly.
+        if not os.path.ismount(root.parent):
+            return False
         try:
             root.mkdir(parents=True, exist_ok=True)
             probe = root / ".btrfs-restore-write-test"
