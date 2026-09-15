@@ -59,6 +59,10 @@ def _run_pbs(argv=None) -> int:
     return _run_mode("btrfs_restore.cli_pbs", argv or [])
 
 
+def _run_pbs_restore(argv=None) -> int:
+    return _run_mode("btrfs_restore.cli_pbs_restore", argv or [])
+
+
 def _run_restore() -> int:
     return _run_mode(str(_PKG_ROOT / "main.py"))
 
@@ -105,6 +109,7 @@ def _print_menu():
     header.append(f"  Source: {host}   FS: btrfs   Target: {dest}\n\n", style="dim #00FF66")
     header.append("   [B]  Backup now\n", style="#00FF66")
     header.append("   [P]  Push last backup to Proxmox (PBS)\n", style="#00FF66")
+    header.append("   [X]  Restore files / folders from Proxmox (PBS)\n", style="#00FF66")
     header.append("   [R]  Restore files / folders\n", style="#00FF66")
     header.append("   [F]  Full recovery (freshly installed machine)\n", style="#00FF66")
     header.append("   [S]  Settings (backup destination, SSH remote)\n", style="#00FF66")
@@ -179,6 +184,10 @@ def _menu() -> int:
             _run_pbs()
             console.print()
             _print_menu()
+        elif choice in ("x", "pbs-restore"):
+            _run_pbs_restore()
+            console.print()
+            _print_menu()
         elif choice in ("r", "restore", "restaurar"):
             _run_restore()
             console.print()
@@ -201,6 +210,8 @@ def main() -> None:
         sys.exit(_run_backup(args[1:]))
     elif args and args[0] == "pbs":
         sys.exit(_run_pbs(args[1:]))
+    elif args and args[0] == "pbs-restore":
+        sys.exit(_run_pbs_restore(args[1:]))
     elif args and args[0] in ("restore", "restore-now"):
         sys.exit(_run_restore())
     elif args and args[0] == "settings":
