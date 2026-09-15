@@ -2,13 +2,16 @@
 `restore-tui` - single entry point. With no arguments it shows a retro menu:
 
     [B]  Backup now
+    [P]  Push last backup to Proxmox (PBS)
     [R]  Restore files / folders
     [F]  Full recovery (freshly installed machine)
     [S]  Settings (backup destination, SSH remote)
     [Q]  Quit
 
-`restore-tui backup [...]` and `restore-tui restore` jump straight into a mode
-(so do the `backup-now` / `restore-now` aliases). Privilege elevation is
+`restore-tui backup [...]`, `restore-tui pbs` and `restore-tui restore` jump
+straight into a mode (so do the `backup-now` / `restore-now` aliases). Taking
+the snapshot [B] and pushing it to PBS [P] are deliberately separate, manual
+steps - no cron. Privilege elevation is
 deferred: the menu and status run unprivileged; picking Backup or Restore
 re-execs that one command under sudo. Settings runs unprivileged always - it
 only edits the user's own config.conf.
@@ -50,6 +53,14 @@ def _run_mode(module_or_path: str, extra_args=None) -> int:
 
 def _run_backup(argv=None) -> int:
     return _run_mode("btrfs_restore.cli_backup", argv or [])
+
+
+def _run_pbs(argv=None) -> int:
+    return _run_mode("btrfs_restore.cli_pbs", argv or [])
+
+
+def _run_pbs_restore(argv=None) -> int:
+    return _run_mode("btrfs_restore.cli_pbs_restore", argv or [])
 
 
 def _run_restore() -> int:
@@ -97,6 +108,8 @@ def _print_menu():
     header.append("  BTRFS RESTORE TUI\n", style="bold #00FF66")
     header.append(f"  Source: {host}   FS: btrfs   Target: {dest}\n\n", style="dim #00FF66")
     header.append("   [B]  Backup now\n", style="#00FF66")
+    header.append("   [P]  Push last backup to Proxmox (PBS)\n", style="#00FF66")
+    header.append("   [X]  Restore files / folders from Proxmox (PBS)\n", style="#00FF66")
     header.append("   [R]  Restore files / folders\n", style="#00FF66")
     header.append("   [F]  Full recovery (freshly installed machine)\n", style="#00FF66")
     header.append("   [S]  Settings (backup destination, SSH remote)\n", style="#00FF66")
@@ -167,6 +180,14 @@ def _menu() -> int:
             _run_backup()
             console.print()
             _print_menu()
+        elif choice in ("p", "pbs"):
+            _run_pbs()
+            console.print()
+            _print_menu()
+        elif choice in ("x", "pbs-restore"):
+            _run_pbs_restore()
+            console.print()
+            _print_menu()
         elif choice in ("r", "restore", "restaurar"):
             _run_restore()
             console.print()
@@ -187,6 +208,10 @@ def main() -> None:
     args = sys.argv[1:]
     if args and args[0] in ("backup", "backup-now"):
         sys.exit(_run_backup(args[1:]))
+    elif args and args[0] == "pbs":
+        sys.exit(_run_pbs(args[1:]))
+    elif args and args[0] == "pbs-restore":
+        sys.exit(_run_pbs_restore(args[1:]))
     elif args and args[0] in ("restore", "restore-now"):
         sys.exit(_run_restore())
     elif args and args[0] == "settings":
