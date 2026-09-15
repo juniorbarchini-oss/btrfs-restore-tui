@@ -190,7 +190,7 @@ class PBSRestoreApp(App):
         return None
 
     def _populate_node(self, node: TreeNode) -> None:
-        if node.data.get("loaded"):
+        if node.data is None or node.data.get("loaded"):
             return
         path: Path = node.data["path"]
         if not path.is_dir():
