@@ -145,6 +145,9 @@ class BackupTestBase(unittest.TestCase):
             mock.patch.object(cfgmod, "_home_of", return_value=root),
             mock.patch.object(cfgmod, "_autodetect_backup_target", return_value=None),
             mock.patch("btrfs_restore.backup.os.geteuid", return_value=0),
+            # the fake USB dir here is a plain tempdir, not a real mountpoint -
+            # tests aren't exercising the mount-point safety check itself.
+            mock.patch("btrfs_restore.backup.os.path.ismount", return_value=True),
             mock.patch("btrfs_restore.backup.SystemStateCollector", StubStateCollector),
             mock.patch.dict(os.environ, {}, clear=True),
         ]
@@ -240,6 +243,23 @@ class TestBackupSafety(BackupTestBase):
             r = BtrfsBackupEngine(cfg, ops=FakeBtrfsOps()).run()
         self.assertEqual(r.status, "failed")
         self.assertIn("root", r.message)
+
+    def test_stale_unmounted_target_dir_is_rejected_not_written_to(self):
+        """Real incident: TARGET_DIR pinned to a USB mount point that was
+        left behind (drive unplugged) is still a perfectly writable plain
+        directory - it must NOT be accepted as a live backup target, or the
+        stream lands on / instead of the USB and nobody notices."""
+        cfg = self.make_cfg()
+        # this test's own fixture patches os.path.ismount -> True for
+        # everything (see BackupTestBase.setUp); here we want the real,
+        # narrower answer for this one specific "stale" path.
+        with mock.patch("btrfs_restore.backup.os.path.ismount", return_value=False):
+            r = BtrfsBackupEngine(cfg, ops=FakeBtrfsOps(target_is_btrfs=True)).run()
+        self.assertEqual(r.status, "failed")
+        self.assertIn("No backup target", r.message)
+        if cfg.target_root.parent.exists():
+            self.assertFalse(any(cfg.target_root.parent.iterdir()),
+                              "nothing should have been written to the fake target")
 
 
 class TestBackupRetention(BackupTestBase):
