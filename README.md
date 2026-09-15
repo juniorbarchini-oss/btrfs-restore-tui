@@ -158,6 +158,11 @@ REMOTE_PORT=22
 # EXCLUDE=*/node_modules               # extra backup exclusions, one per line
 # EXCLUDE_DEFAULTS=off                 # drop the built-in exclusion list
 # MAX_DISK_PERCENT=80  MIN_KEEP=2  LOCAL_KEEP=10
+
+# --- Proxmox Backup Server target (menu option [P], offsite) ---------
+# PBS_REPOSITORY=user@realm!token@host:datastore
+# PBS_PASSWORD=<api token secret>
+# PBS_FINGERPRINT=<server fingerprint - `proxmox-backup-manager cert info`>
 ```
 
 Every key also works as an environment variable with the `RESTORE_TUI_` prefix

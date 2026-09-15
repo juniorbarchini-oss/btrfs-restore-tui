@@ -229,6 +229,13 @@ class Config:
     remote_port: int = 22
     remote_name: str = "Remote"
 
+    # -- Proxmox Backup Server target (offsite, separate from remote SSH) --
+    # Same env var names proxmox-backup-client itself reads, so they pass
+    # straight through - see PBS_REPOSITORY="user@realm!token@host:datastore".
+    pbs_repository: str = ""
+    pbs_password: str = ""
+    pbs_fingerprint: str = ""
+
     config_source: str = "(defaults)"
 
     # -- derived paths (same names/shape as ext4) --------------------
@@ -318,6 +325,11 @@ class Config:
             cfg.remote_port = 22
         if cfg.remote_name == "Remote" and cfg.remote_host:
             cfg.remote_name = cfg.remote_host
+
+        # --- Proxmox Backup Server ------------------------------------
+        cfg.pbs_repository = _env("PBS_REPOSITORY") or fv.get("PBS_REPOSITORY", "")
+        cfg.pbs_password = _env("PBS_PASSWORD") or fv.get("PBS_PASSWORD", "")
+        cfg.pbs_fingerprint = _env("PBS_FINGERPRINT") or fv.get("PBS_FINGERPRINT", "")
 
         return cfg
 
