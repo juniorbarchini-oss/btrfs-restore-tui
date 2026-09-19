@@ -122,6 +122,31 @@ def _confirm_remote_full(cfg: Config) -> bool:
     return _confirm("Continue with a full backup to i7server?")
 
 
+def _confirm_remote_heal(cfg: Config) -> list:
+    """Offer to delete half-received copies on the remote. Returns the approved
+    [(kind, name)]; nothing is deleted without an explicit y (no terminal = no)."""
+    try:
+        partial = BtrfsBackupEngine(cfg).remote_partial_copies()
+    except RemoteQueryError:
+        return []                       # the full-backup check already reported it
+    if not partial:
+        return []
+    deletable = [p for p in partial if not p["has_children"]]
+    lines = [f"  {p['kind']}/{p['name']}" + ("  (kept: other snapshots depend on it)"
+                                             if p["has_children"] else "")
+             for p in partial]
+    console.print(Panel(
+        f"[bold yellow]i7server: {len(partial)} partial (half-received) "
+        "copy(ies) found[/bold yellow]\n" + "\n".join(lines) + "\n\n"
+        "Left over by an interrupted receive. They are never used as a base, but "
+        "they take space and hide problems.",
+        border_style="yellow", title="[yellow]Confirm[/yellow]"))
+    if deletable and _confirm(f"Delete {len(deletable)} partial copy(ies) on i7server?"):
+        return [(p["kind"], p["name"]) for p in deletable]
+    console.print("[dim]Partial copies left in place.[/dim]")
+    return []
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="backup-now",
@@ -165,14 +190,17 @@ def main() -> None:
         sys.exit(2)
 
     skip_remote = False
-    if (not args.dry_run and not args.yes and cfg.remote_host and cfg.remote_path
+    heal_approved: list = []
+    if (not args.dry_run and cfg.remote_host and cfg.remote_path
             and BtrfsBackupEngine(cfg)._remote_enabled()):
-        if not _confirm_remote_full(cfg):
+        if not args.yes and not _confirm_remote_full(cfg):
             console.print("[dim]i7server skipped.[/dim]")
             skip_remote = True
             if not cfg.target_root:
                 console.print("[dim]Nothing to do.[/dim]")
                 sys.exit(3)
+        if not skip_remote:
+            heal_approved = _confirm_remote_heal(cfg)   # --yes never approves deletions
 
     try:
         if args.quiet or args.dry_run:
@@ -183,11 +211,13 @@ def main() -> None:
                     console.print(f"[{t}] {m}", style=t)
             engine = BtrfsBackupEngine(cfg, callback=quiet_cb)
             engine.skip_remote = skip_remote
+            engine.heal_approved = heal_approved
             result = engine.run(dry_run=args.dry_run)
         else:
             dash = Dashboard("Synchronizing snapshots")
             engine = BtrfsBackupEngine(cfg, callback=dash.on_event)
             engine.skip_remote = skip_remote
+            engine.heal_approved = heal_approved
             stop = threading.Event()
             from rich.live import Live
 

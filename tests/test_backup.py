@@ -33,6 +33,9 @@ class FakeBtrfsOps:
         self.ssh_sent = []                          # (kind, parent_name) to remote
         self.remote_subvols = {"root": [], "home": []}
         self.remote_partial = {}                    # kind -> half-received (rw) names
+        self.remote_children = set()                # partial names that have a dependent snapshot
+        self.receive_alive = False                  # a btrfs receive is running remotely
+        self.ssh_deleted = []
         self.ssh_calls = []
         self.pushed_trees = []                       # [(remote_dir, {relpath: bytes})]
 
@@ -86,6 +89,11 @@ class FakeBtrfsOps:
     def ssh_capture(self, ssh_argv, remote, cmd_argv, timeout=25):
         self.ssh_calls.append(list(cmd_argv))
         out = ""
+        if cmd_argv[0] == "pgrep":
+            return _CP(0 if self.receive_alive else 1, "", "")
+        if cmd_argv[:4] == ["sudo", "btrfs", "subvolume", "delete"]:
+            self.ssh_deleted.append(cmd_argv[-1])
+            return _CP(0, "", "")
         if cmd_argv[:2] == ["test", "-d"] and self.missing_dir:
             return _CP(1, "", "")
         if cmd_argv[:4] == ["sudo", "btrfs", "subvolume", "list"]:
@@ -94,11 +102,18 @@ class FakeBtrfsOps:
             if self.list_failure == "ssh255":
                 return _CP(255, "", "ssh: connect to host 10.0.0.9: No route to host")
             kind = cmd_argv[-1].rstrip("/").split("/")[-1]
-            out = "".join(f"ID 1 gen 1 top level 5 received_uuid u-{n} path {kind}/{n}\n"
+            out = "".join(f"ID 1 gen 1 top level 5 parent_uuid - received_uuid u-{n} "
+                          f"uuid id-{n} path {kind}/{n}\n"
                           for n in self.remote_subvols.get(kind, []))
             if "-r" not in cmd_argv:       # -r = read-only only: partials show up otherwise
-                out += "".join(f"ID 2 gen 2 top level 5 received_uuid - path {kind}/{n}\n"
-                               for n in self.remote_partial.get(kind, []))
+                for n in self.remote_partial.get(kind, []):
+                    out += (f"ID 2 gen 2 top level 5 parent_uuid - received_uuid - "
+                            f"uuid id-{n} path {kind}/{n}\n")
+        if cmd_argv[:4] == ["sudo", "btrfs", "subvolume", "list"]:
+            for n in self.remote_partial.get(kind, []):
+                if n in self.remote_children:      # a complete snapshot depending on it
+                    out += (f"ID 3 gen 3 top level 5 parent_uuid id-{n} received_uuid u-kid "
+                            f"uuid id-kid path {kind}/{kind}_20991231_000000\n")
         return _CP(0, out, "")
 
     def send_ssh_receive(self, source, parent, ssh_argv, remote, receive_argv):
@@ -445,6 +460,84 @@ class TestBackupRemote(BackupTestBase):
         self.assertTrue(BtrfsBackupEngine._has_received_uuid(
             "ID 5 gen 1 top level 5 received_uuid abc-1 path home/home_20260101_000000"))
         self.assertFalse(BtrfsBackupEngine._has_received_uuid("ID 5 path home/x"))
+
+    # -- self-heal of half-received copies (issue #24) --------------------
+    def _heal_setup(self, partial_names=None, **fake_kw):
+        cfg = self._remote_cfg()
+        ops = FakeBtrfsOps(target_is_btrfs=True)
+        for key, val in fake_kw.items():
+            setattr(ops, key, val)
+        self.kinds = ["root" if m == "/" else Path(m).name for m in cfg.source_mounts]
+        for k in self.kinds:
+            for n in (partial_names or [f"{k}_20260102_000000"]):
+                ops.remote_partial.setdefault(k, []).append(n)
+        return cfg, ops
+
+    def _run_heal(self, cfg, ops, approved):
+        events = []
+        eng = BtrfsBackupEngine(cfg, ops=ops, callback=lambda t, m: events.append((t, m)))
+        eng.heal_approved = approved
+        r = eng.run()
+        return r, events
+
+    def test_partial_copies_are_listed_without_deleting(self):
+        cfg, ops = self._heal_setup()
+        found = BtrfsBackupEngine(cfg, ops=ops).remote_partial_copies()
+        self.assertEqual({(f["kind"], f["name"]) for f in found},
+                         {(k, f"{k}_20260102_000000") for k in self.kinds})
+        self.assertTrue(all(not f["has_children"] for f in found))
+        self.assertEqual(ops.ssh_deleted, [])
+
+    def test_name_outside_the_timestamp_pattern_is_never_listed(self):
+        cfg, ops = self._heal_setup(partial_names=["manual_thing", "x_20260102_000000"])
+        self.assertEqual(BtrfsBackupEngine(cfg, ops=ops).remote_partial_copies(), [])
+
+    def test_approved_partial_copy_is_deleted_and_logged(self):
+        cfg, ops = self._heal_setup()
+        approved = [(k, f"{k}_20260102_000000") for k in self.kinds]
+        r, events = self._run_heal(cfg, ops, approved)
+        self.assertEqual(r.status, "completed", r.message)
+        self.assertEqual(sorted(ops.ssh_deleted), sorted(
+            f"/srv/backups/{k}/{k}_20260102_000000" for k in self.kinds))
+        self.assertTrue(any("deleted partial copy" in m for _, m in events))
+
+    def test_nothing_deleted_without_approval(self):
+        cfg, ops = self._heal_setup()
+        self._run_heal(cfg, ops, [])
+        self.assertEqual(ops.ssh_deleted, [])
+
+    def test_nothing_deleted_while_a_receive_is_running(self):
+        cfg, ops = self._heal_setup(receive_alive=True)
+        approved = [(k, f"{k}_20260102_000000") for k in self.kinds]
+        _, events = self._run_heal(cfg, ops, approved)
+        self.assertEqual(ops.ssh_deleted, [])
+        self.assertTrue(any("receive is running" in m for _, m in events))
+
+    def test_copy_with_dependents_is_kept(self):
+        cfg, ops = self._heal_setup()
+        for k in self.kinds:
+            ops.remote_children.add(f"{k}_20260102_000000")
+        found = BtrfsBackupEngine(cfg, ops=ops).remote_partial_copies()
+        self.assertTrue(all(f["has_children"] for f in found))
+        approved = [(k, f"{k}_20260102_000000") for k in self.kinds]
+        _, events = self._run_heal(cfg, ops, approved)
+        self.assertEqual(ops.ssh_deleted, [])
+        self.assertTrue(any("depending on it" in m for _, m in events))
+
+    def test_approved_name_that_is_not_partial_is_not_deleted(self):
+        cfg, ops = self._heal_setup()
+        good = {}
+        for k in self.kinds:
+            self._local_and_remote(ops, k, f"{k}_20260101_000000")
+            good[k] = f"{k}_20260101_000000"
+        _, events = self._run_heal(cfg, ops, list(good.items()))
+        self.assertFalse([d for d in ops.ssh_deleted if "20260101" in d])
+
+    def test_query_failure_while_healing_deletes_nothing(self):
+        cfg, ops = self._heal_setup(list_failure="ssh255")
+        approved = [(k, f"{k}_20260102_000000") for k in self.kinds]
+        self._run_heal(cfg, ops, approved)
+        self.assertEqual(ops.ssh_deleted, [])
 
     def test_remote_send_failure_is_partial(self):
         cfg = self._remote_cfg()

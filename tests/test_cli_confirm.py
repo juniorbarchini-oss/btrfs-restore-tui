@@ -56,5 +56,42 @@ class TestConfirmRemoteFull(unittest.TestCase):
         self.assertIn("timed out after 25s", shown)
 
 
+class TestConfirmRemoteHeal(unittest.TestCase):
+    P = [{"kind": "home", "name": "home_20260915_001833", "has_children": False},
+         {"kind": "root", "name": "root_20260915_001833", "has_children": True}]
+
+    def _run(self, eng, answer):
+        with mock.patch.object(cli_backup, "BtrfsBackupEngine", return_value=eng), \
+             mock.patch.object(cli_backup.console, "print"), \
+             mock.patch("builtins.input", side_effect=answer) as inp:
+            return cli_backup._confirm_remote_heal(_Cfg()), inp
+
+    def _eng(self, partial=None, error=None):
+        eng = mock.Mock()
+        if error:
+            eng.remote_partial_copies.side_effect = error
+        else:
+            eng.remote_partial_copies.return_value = partial
+        return eng
+
+    def test_nothing_partial_asks_nothing(self):
+        approved, inp = self._run(self._eng(partial=[]), ["y"])
+        self.assertEqual(approved, [])
+        inp.assert_not_called()
+
+    def test_yes_approves_only_copies_without_dependents(self):
+        approved, _ = self._run(self._eng(partial=self.P), ["y"])
+        self.assertEqual(approved, [("home", "home_20260915_001833")])
+
+    def test_default_and_no_terminal_delete_nothing(self):
+        self.assertEqual(self._run(self._eng(partial=self.P), [""])[0], [])
+        self.assertEqual(self._run(self._eng(partial=self.P), EOFError())[0], [])
+
+    def test_query_error_is_silent_and_deletes_nothing(self):
+        approved, inp = self._run(self._eng(error=RemoteQueryError("x")), ["y"])
+        self.assertEqual(approved, [])
+        inp.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
