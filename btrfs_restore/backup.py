@@ -93,6 +93,7 @@ class BackupResult:
 
 
 class BtrfsBackupEngine:
+    heal_approved: List[tuple] = []   # (kind, name) partial remote copies the user OK'd to delete
     _remote_reason = ""          # why i7server failed, for the final summary
     skip_remote = False          # set by the CLI when the user declines a full send
 
@@ -423,6 +424,7 @@ class BtrfsBackupEngine:
                 self._emit("error", f"i7server: {mk.stderr.strip() or 'ssh failed'}")
                 return "unreachable"
 
+            self._heal_remote(ssh, remote, base, local_snaps)
             for kind, local_name in local_snaps.items():
                 local = self.cfg.local_snapshots_dir / local_name
                 parent = self._remote_parent(kind, ssh, remote, base)
@@ -461,6 +463,103 @@ class BtrfsBackupEngine:
             return parts[parts.index("received_uuid") + 1] != "-"
         except (ValueError, IndexError):
             return False
+
+    @staticmethod
+    def _parse_subvol(line: str) -> dict:
+        """`btrfs subvolume list -u -q -R` line -> {uuid, parent_uuid, received_uuid, path}."""
+        out = {}
+        parts = line.split()
+        for key in ("uuid", "parent_uuid", "received_uuid"):
+            if key in parts and parts.index(key) + 1 < len(parts):
+                out[key] = parts[parts.index(key) + 1]
+        if "path" in line:
+            out["path"] = line.split("path", 1)[1].strip()
+        return out
+
+    def _ssh_or_raise(self, ssh, remote: str, argv: List[str], what: str):
+        try:
+            res = self.ops.ssh_capture(ssh, remote, argv)
+        except subprocess.TimeoutExpired as exc:
+            raise RemoteQueryError(f"{what}: timed out after {exc.timeout}s") from exc
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RemoteQueryError(f"{what}: {exc}") from exc
+        return res
+
+    def remote_partial_copies(self) -> List[dict]:
+        """Half-received copies under <base>/root and <base>/home: read-write with
+        received_uuid '-' (a finished receive is read-only and has one). Each item
+        is {kind, name, has_children}. Raises RemoteQueryError if the remote
+        cannot be asked. Read-only: deletes nothing."""
+        ssh = build_ssh_args(self.cfg, self.cfg.user)
+        remote = f"{self.cfg.remote_user or self.cfg.user}@{self.cfg.remote_host}"
+        base = self.cfg.remote_path.rstrip("/")
+        kinds = ["root" if m == "/" else Path(m).name for m in self.cfg.source_mounts]
+        found, all_subvols = [], []
+        for kind in kinds:
+            path = f"{base}/{kind}"
+            exists = self._ssh_or_raise(ssh, remote, ["test", "-d", path],
+                                        f"could not check {kind} copies on the remote")
+            if exists.returncode == 1:
+                continue
+            allq = self._ssh_or_raise(
+                ssh, remote, ["sudo", "btrfs", "subvolume", "list", "-o", "-u", "-q", "-R", path],
+                f"could not list {kind} copies on the remote")
+            roq = self._ssh_or_raise(
+                ssh, remote, ["sudo", "btrfs", "subvolume", "list", "-o", "-r", path],
+                f"could not list {kind} copies on the remote")
+            for res in (allq, roq):
+                if res.returncode != 0:
+                    raise RemoteQueryError(
+                        f"could not list {kind} copies on the remote (exit {res.returncode}): "
+                        f"{(res.stderr or '').strip() or 'no error text'}")
+            ro_paths = {self._parse_subvol(ln).get("path") for ln in roq.stdout.splitlines()
+                        if "path" in ln}
+            subs = [self._parse_subvol(ln) for ln in allq.stdout.splitlines() if "path" in ln]
+            all_subvols += subs
+            for sv in subs:
+                name = sv["path"].split("/")[-1]
+                if (_COMPACT_RE.match(name) and name.startswith(f"{kind}_")
+                        and sv["path"] not in ro_paths and sv.get("received_uuid") == "-"
+                        and sv.get("uuid")):
+                    found.append({"kind": kind, "name": name, "uuid": sv["uuid"]})
+        for item in found:
+            item["has_children"] = any(sv.get("parent_uuid") == item["uuid"] for sv in all_subvols)
+            del item["uuid"]
+        return found
+
+    def _heal_remote(self, ssh, remote: str, base: str, local_snaps: Dict[str, str]) -> None:
+        """Delete the partial remote copies the user approved, re-checking every
+        safeguard right before deleting. Anything that does not add up is kept."""
+        if not self.heal_approved:
+            return
+        try:
+            alive = self._ssh_or_raise(ssh, remote, ["pgrep", "-f", "'[b]trfs receive'"],
+                                       "could not check for a running btrfs receive")
+            if alive.returncode != 1:
+                self._emit("warning", "i7server: a btrfs receive is running (or could not be "
+                                      "checked) - not deleting partial copies")
+                return
+            current = {(c["kind"], c["name"]): c for c in self.remote_partial_copies()}
+        except RemoteQueryError as exc:
+            self._emit("warning", f"i7server: partial copies not deleted - {exc}")
+            return
+        for kind, name in self.heal_approved:
+            item = current.get((kind, name))
+            if item is None:
+                self._emit("info", f"i7server: {name} is no longer a partial copy - kept")
+            elif item["has_children"]:
+                self._emit("warning", f"i7server: {name} has snapshots depending on it - kept")
+            elif name == local_snaps.get(kind):
+                self._emit("warning", f"i7server: {name} is the copy being sent - kept")
+            else:
+                d = self.ops.ssh_capture(
+                    ssh, remote, ["sudo", "btrfs", "subvolume", "delete", f"{base}/{kind}/{name}"])
+                if d.returncode == 0:
+                    self._emit("warning", f"i7server: deleted partial copy {kind}/{name} "
+                                          f"(read-write, no received_uuid: an interrupted receive)")
+                else:
+                    self._emit("warning", f"i7server: could not delete {name}: "
+                                          f"{(d.stderr or '').strip() or d.returncode}")
 
     def remote_full_kinds(self) -> List[str]:
         """Kinds (root/home) that would be sent as a FULL backup to the remote
