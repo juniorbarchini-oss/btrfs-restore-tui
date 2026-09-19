@@ -539,6 +539,17 @@ class TestBackupRemote(BackupTestBase):
         self._run_heal(cfg, ops, approved)
         self.assertEqual(ops.ssh_deleted, [])
 
+    def test_receiver_error_reaches_the_log_and_the_summary(self):
+        cfg = self._remote_cfg()
+        ops = FakeBtrfsOps(target_is_btrfs=True, fail_send_on={"homefs"})
+        ops.last_stderr = "ssh[1]: ERROR: cannot receive: parent subvol is not read-only"
+        events = []
+        r = BtrfsBackupEngine(cfg, ops=ops, callback=lambda t, m: events.append((t, m))).run()
+        self.assertEqual(r.status, "partial", r.message)
+        self.assertIn("parent subvol is not read-only", r.message)
+        self.assertTrue(any("parent subvol is not read-only" in m for t, m in events
+                            if t == "error"))
+
     def test_remote_send_failure_is_partial(self):
         cfg = self._remote_cfg()
         ops = FakeBtrfsOps(target_is_btrfs=True, fail_send_on={"homefs"})

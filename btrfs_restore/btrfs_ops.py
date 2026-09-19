@@ -167,6 +167,8 @@ class BtrfsOps:
     def run_pipeline(self, stages: List[Sequence[str]], final_stdout=None) -> int:
         procs: List[subprocess.Popen] = []
         readers: List[threading.Thread] = []
+        errs: dict = {}
+        self._last_stderr = ""
         prev_stdout = None
         try:
             for i, stage in enumerate(stages):
@@ -188,6 +190,9 @@ class BtrfsOps:
                     t = threading.Thread(target=self._pump_pv, args=(p,), daemon=True)
                     t.start()
                     readers.append(t)
+                elif not is_pv:
+                    readers.append(self._drain_stderr(
+                        p, f"{os.path.basename(stage[0])}[{i}]", errs))
         except FileNotFoundError:
             _kill_process_group(procs)
             raise
@@ -205,11 +210,38 @@ class BtrfsOps:
             raise
         for t in readers:
             t.join(timeout=1.0)
+        self._collect_stderr(errs)
 
         for p in procs:
             if p.returncode not in (0, None):
                 return p.returncode
         return procs[-1].returncode if procs else 0
+
+    @property
+    def last_stderr(self) -> str:
+        """Tail of the stderr of every stage of the last send pipeline, e.g.
+        'ssh: ERROR: cannot receive: ...' (empty when nothing was printed)."""
+        return getattr(self, "_last_stderr", "")
+
+    @staticmethod
+    def _drain_stderr(proc: subprocess.Popen, label: str, store: dict) -> threading.Thread:
+        def run() -> None:
+            buf = b""
+            try:
+                while True:
+                    chunk = proc.stderr.read(1024)
+                    if not chunk:
+                        break
+                    buf = (buf + chunk)[-2000:]
+            except (OSError, ValueError):
+                pass
+            store[label] = buf.decode("utf-8", "replace").strip()
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        return t
+
+    def _collect_stderr(self, store: dict) -> None:
+        self._last_stderr = "; ".join(f"{k}: {v}" for k, v in store.items() if v)
 
     def _pump_pv(self, proc: subprocess.Popen) -> None:
         buf = b""
@@ -252,6 +284,10 @@ class BtrfsOps:
                                   stdout=(final_stdout if final_stdout is not None
                                           else subprocess.PIPE),
                                   stderr=subprocess.PIPE, start_new_session=True)
+        errs: dict = {}
+        self._last_stderr = ""
+        drains = [self._drain_stderr(p_send, "btrfs send", errs),
+                  self._drain_stderr(p_sink, os.path.basename(sink[0]), errs)]
         total = 0
         start = last = time.monotonic()
         try:
@@ -282,6 +318,9 @@ class BtrfsOps:
                     pass
         p_send.wait()
         p_sink.wait()
+        for t in drains:
+            t.join(timeout=1.0)
+        self._collect_stderr(errs)
         if total:
             self._progress_cb(f"{_human(total)} sent")
         return p_send.returncode or p_sink.returncode
