@@ -32,6 +32,7 @@ class FakeBtrfsOps:
         self.sent = []
         self.ssh_sent = []                          # (kind, parent_name) to remote
         self.remote_subvols = {"root": [], "home": []}
+        self.remote_partial = {}                    # kind -> half-received (rw) names
         self.ssh_calls = []
         self.pushed_trees = []                       # [(remote_dir, {relpath: bytes})]
 
@@ -93,8 +94,11 @@ class FakeBtrfsOps:
             if self.list_failure == "ssh255":
                 return _CP(255, "", "ssh: connect to host 10.0.0.9: No route to host")
             kind = cmd_argv[-1].rstrip("/").split("/")[-1]
-            out = "".join(f"ID 1 gen 1 top level 5 path {kind}/{n}\n"
+            out = "".join(f"ID 1 gen 1 top level 5 received_uuid u-{n} path {kind}/{n}\n"
                           for n in self.remote_subvols.get(kind, []))
+            if "-r" not in cmd_argv:       # -r = read-only only: partials show up otherwise
+                out += "".join(f"ID 2 gen 2 top level 5 received_uuid - path {kind}/{n}\n"
+                               for n in self.remote_partial.get(kind, []))
         return _CP(0, out, "")
 
     def send_ssh_receive(self, source, parent, ssh_argv, remote, receive_argv):
@@ -410,6 +414,37 @@ class TestBackupRemote(BackupTestBase):
         r = eng.run()
         self.assertEqual(r.status, "completed", r.message)
         self.assertEqual(ops.ssh_sent, [])
+
+    def _local_and_remote(self, ops, kind, name, partial=False):
+        (self.local_snaps / name).mkdir(exist_ok=True)
+        target = ops.remote_partial if partial else ops.remote_subvols
+        target.setdefault(kind, []).append(name)
+
+    def test_half_received_remote_snapshot_is_never_the_base(self):
+        cfg = self._remote_cfg()
+        ops = FakeBtrfsOps(target_is_btrfs=True)
+        for kind in ("rootfs", "homefs"):
+            self._local_and_remote(ops, kind, f"{kind}_20260101_000000")
+            self._local_and_remote(ops, kind, f"{kind}_20260102_000000", partial=True)
+        r = BtrfsBackupEngine(cfg, ops=ops).run()
+        self.assertEqual(r.status, "completed", r.message)
+        # falls back to the older COMPLETE copy, not the newer broken one
+        self.assertTrue(all(p == f"{k}_20260101_000000" for k, p in ops.ssh_sent))
+
+    def test_only_half_received_copies_means_full(self):
+        cfg = self._remote_cfg()
+        ops = FakeBtrfsOps(target_is_btrfs=True)
+        for kind in ("rootfs", "homefs"):
+            self._local_and_remote(ops, kind, f"{kind}_20260102_000000", partial=True)
+        eng = BtrfsBackupEngine(cfg, ops=ops)
+        self.assertEqual(len(eng.remote_full_kinds()), len(cfg.source_mounts))
+
+    def test_received_uuid_dash_line_is_not_a_valid_base(self):
+        self.assertFalse(BtrfsBackupEngine._has_received_uuid(
+            "ID 5 gen 1 top level 5 received_uuid - path home/home_20260101_000000"))
+        self.assertTrue(BtrfsBackupEngine._has_received_uuid(
+            "ID 5 gen 1 top level 5 received_uuid abc-1 path home/home_20260101_000000"))
+        self.assertFalse(BtrfsBackupEngine._has_received_uuid("ID 5 path home/x"))
 
     def test_remote_send_failure_is_partial(self):
         cfg = self._remote_cfg()

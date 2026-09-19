@@ -454,6 +454,14 @@ class BtrfsBackupEngine:
             self._emit("error", f"i7server: {exc}")
             return "failed"
 
+    @staticmethod
+    def _has_received_uuid(line: str) -> bool:
+        parts = line.split()
+        try:
+            return parts[parts.index("received_uuid") + 1] != "-"
+        except (ValueError, IndexError):
+            return False
+
     def remote_full_kinds(self) -> List[str]:
         """Kinds (root/home) that would be sent as a FULL backup to the remote
         right now. Raises RemoteQueryError if the remote cannot be asked."""
@@ -464,8 +472,9 @@ class BtrfsBackupEngine:
         return [k for k in kinds if self._remote_parent(k, ssh, remote, base) is None]
 
     def _remote_parent(self, kind: str, ssh, remote: str, base: str) -> Optional[Path]:
-        """Newest <kind>_* subvolume already on the remote that also exists in
-        /.snapshots locally - the only valid `btrfs send -p` base.
+        """Newest COMPLETE <kind>_* subvolume already on the remote (read-only,
+        with a received_uuid) that also exists in /.snapshots locally - the only
+        valid `btrfs send -p` base.
 
         Returns None only when the remote answered and holds no usable base
         (=> a full send is legitimate). If the remote could not be asked at
@@ -475,7 +484,8 @@ class BtrfsBackupEngine:
             if exists.returncode == 1:
                 return None          # remote answered: folder not there yet
             res = (exists if exists.returncode != 0 else self.ops.ssh_capture(
-                ssh, remote, ["sudo", "btrfs", "subvolume", "list", "-o", f"{base}/{kind}"]))
+                ssh, remote,
+                ["sudo", "btrfs", "subvolume", "list", "-o", "-r", "-R", f"{base}/{kind}"]))
         except subprocess.TimeoutExpired as exc:
             raise RemoteQueryError(
                 f"could not list {kind} copies on the remote: timed out after "
@@ -487,9 +497,13 @@ class BtrfsBackupEngine:
             raise RemoteQueryError(
                 f"could not list {kind} copies on the remote "
                 f"(exit {res.returncode}): {(res.stderr or '').strip() or 'no error text'}")
+        # -r lists only read-only subvolumes and -R adds the received_uuid: a
+        # half-received copy is read-write and has received_uuid "-", so it can
+        # never be picked as a base (a receive that died midway used to be).
         names = sorted(
             line.split("path", 1)[1].strip().split("/")[-1]
-            for line in res.stdout.splitlines() if "path" in line
+            for line in res.stdout.splitlines()
+            if "path" in line and self._has_received_uuid(line)
         )
         names = [n for n in names if _COMPACT_RE.match(n) and n.startswith(f"{kind}_")]
         for n in reversed(names):
