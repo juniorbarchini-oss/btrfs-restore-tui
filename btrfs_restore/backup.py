@@ -634,7 +634,10 @@ class BtrfsBackupEngine:
                 names = sorted(
                     ln.split("path", 1)[1].strip().split("/")[-1]
                     for ln in res.stdout.splitlines() if "path" in ln)
-                names = [n for n in names if n.startswith(f"{kind}_")]
+                # timestamped copies only: a hand-made name must never count as
+                # "newest" nor be deleted by the retention pass
+                names = [n for n in names
+                         if _COMPACT_RE.match(n) and n.startswith(f"{kind}_")]
                 for old in names[:-keep]:
                     d = self.ops.ssh_capture(
                         ssh, remote,

@@ -550,6 +550,20 @@ class TestBackupRemote(BackupTestBase):
         self.assertTrue(any("parent subvol is not read-only" in m for t, m in events
                             if t == "error"))
 
+    def test_remote_prune_ignores_names_outside_the_timestamp_pattern(self):
+        cfg = self._remote_cfg()
+        cfg.local_keep = 2
+        ops = FakeBtrfsOps(target_is_btrfs=True)
+        for k in ("root", "home"):      # _prune_remote walks the real kinds
+            ops.remote_subvols[k] = [f"{k}_2026010{i}_000000" for i in range(1, 5)] + [f"{k}_manual"]
+        r = BtrfsBackupEngine(cfg, ops=ops).run()
+        self.assertEqual(r.status, "completed", r.message)
+        self.assertFalse([d for d in ops.ssh_deleted if d.endswith("_manual")])
+        self.assertTrue([d for d in ops.ssh_deleted if "_20260101_" in d])   # old ones still go
+        # the manual name must not push a real copy out of the keep window:
+        # the two newest TIMESTAMPED copies (03 and 04) stay
+        self.assertFalse([d for d in ops.ssh_deleted if "_20260103_" in d or "_20260104_" in d])
+
     def test_remote_send_failure_is_partial(self):
         cfg = self._remote_cfg()
         ops = FakeBtrfsOps(target_is_btrfs=True, fail_send_on={"homefs"})
