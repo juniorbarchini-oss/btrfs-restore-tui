@@ -86,6 +86,34 @@ reason: a failed query is never read as "the remote holds nothing". `--yes` skip
 the prompt, but an unreachable remote still fails that target instead of sending a
 blind full backup. Same behavior as the ext4 edition (`restore-tui`).
 
+**Choosing the incremental base (SSH host).** Only a *complete* remote copy can be
+the `btrfs send -p` parent: read-only **and** with a `received_uuid` (one
+`btrfs subvolume list -o -r -R` query per kind). A half-received copy left by an
+interrupted `btrfs receive` is read-write with no `received_uuid`, so it is never
+picked; the engine falls back to the previous complete copy, or to a full send
+(with the confirmation above).
+
+**Self-heal of half-received copies (SSH host).** Before sending, `backup-now`
+lists such copies under `<remote>/root` and `<remote>/home` and asks
+`Delete N partial copy(ies) on i7server? [y/N]` (default no). Nothing is deleted
+without an explicit `y`: not with `--yes`, not without a terminal. Safeguards,
+re-checked right before each delete: timestamped names only, read-write with no
+`received_uuid` only, nothing that other snapshots depend on (`parent_uuid`),
+nothing while a `btrfs receive` is running on the remote, never the copy being
+sent; every deletion is logged with its reason, and any failed query means no
+deletion. Remote retention likewise only counts and deletes timestamped copies.
+
+**Errors and alerts.** The tail of the sender/receiver stderr is kept and shown
+in the log and the final summary (`i7server: partial (ERROR: cannot receive: ...)`),
+not just `SIGPIPE`. When a backup ends `partial`/`failed`, or i7server is skipped
+because nobody could confirm (timer / no terminal), `backup-now` sends a critical
+desktop notification via `notify-send` (needs `libnotify` and a graphical
+session). It is delivered to the real user's session even when running as root
+(`runuser` + the user's session bus), is not repeated for an hour
+(`/.snapshots/.last-alert`), is cleared as soon as a backup completes, and never
+makes a backup fail. For unattended runs use `--yes` to allow a legitimate full
+backup; deletions still always need a person.
+
 ---
 
 ## 3. Restore TUI (`restore-now`)
