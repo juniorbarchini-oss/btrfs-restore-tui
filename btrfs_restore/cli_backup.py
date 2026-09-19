@@ -14,7 +14,7 @@ from rich.panel import Panel
 from rich.text import Text
 from rich.theme import Theme
 
-from .backup import BtrfsBackupEngine
+from .backup import BtrfsBackupEngine, RemoteQueryError
 from .config import Config, BACKUP_DIRNAME
 
 console = Console(theme=Theme({
@@ -86,6 +86,42 @@ def _header(cfg: Config, dry_run: bool) -> Panel:
     return Panel(text, border_style="green")
 
 
+def _confirm(question: str) -> bool:
+    try:
+        return input(f"{question} [y/N] ").strip().lower() in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        return False
+
+
+def _confirm_remote_full(cfg: Config) -> bool:
+    """Ask before a full send to the remote. True = go ahead (or nothing to
+    ask), False = the user declined. A remote that cannot be asked is never
+    read as 'holds nothing'."""
+    engine = BtrfsBackupEngine(cfg)
+    where = f"{cfg.remote_host}:{cfg.remote_path}"
+    try:
+        full = engine.remote_full_kinds()
+    except RemoteQueryError as exc:
+        console.print(Panel(
+            "[bold yellow]i7server: could not check for previous snapshots[/bold yellow]"
+            f" - {exc}\n"
+            f"Destination: [bold]{where}[/bold]\n\n"
+            "Continuing would send a FULL backup. If you expected a fast "
+            "incremental, stop and check the network / host.",
+            border_style="yellow", title="[yellow]Confirm[/yellow]"))
+    else:
+        if not full:
+            return True
+        console.print(Panel(
+            f"[bold yellow]i7server: this would be a FULL backup[/bold yellow] "
+            f"({', '.join(full)}) - no previous snapshot found there.\n"
+            f"Destination: [bold]{where}[/bold]\n\n"
+            "Normal for the first backup to a target. If you expected a fast "
+            "incremental, stop and check the drive / host.",
+            border_style="yellow", title="[yellow]Confirm[/yellow]"))
+    return _confirm("Continue with a full backup to i7server?")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="backup-now",
@@ -101,6 +137,8 @@ def main() -> None:
                         help="never prune below this many snapshots (default 2)")
     parser.add_argument("--target", metavar="DIR",
                         help="override backup target mount point")
+    parser.add_argument("--yes", "-y", action="store_true",
+                        help="skip the confirmation prompt shown before a full backup")
     parser.add_argument("--quiet", action="store_true",
                         help="plain line output instead of the live dashboard")
     args = parser.parse_args()
@@ -126,6 +164,16 @@ def main() -> None:
             border_style="red"))
         sys.exit(2)
 
+    skip_remote = False
+    if (not args.dry_run and not args.yes and cfg.remote_host and cfg.remote_path
+            and BtrfsBackupEngine(cfg)._remote_enabled()):
+        if not _confirm_remote_full(cfg):
+            console.print("[dim]i7server skipped.[/dim]")
+            skip_remote = True
+            if not cfg.target_root:
+                console.print("[dim]Nothing to do.[/dim]")
+                sys.exit(3)
+
     try:
         if args.quiet or args.dry_run:
             def quiet_cb(t, m):
@@ -134,10 +182,12 @@ def main() -> None:
                 else:
                     console.print(f"[{t}] {m}", style=t)
             engine = BtrfsBackupEngine(cfg, callback=quiet_cb)
+            engine.skip_remote = skip_remote
             result = engine.run(dry_run=args.dry_run)
         else:
             dash = Dashboard("Synchronizing snapshots")
             engine = BtrfsBackupEngine(cfg, callback=dash.on_event)
+            engine.skip_remote = skip_remote
             stop = threading.Event()
             from rich.live import Live
 
