@@ -21,7 +21,10 @@ from btrfs_restore.btrfs_ops import CommandError, prune_paths
 
 
 class FakeBtrfsOps:
-    def __init__(self, *, target_is_btrfs=True, disk_percent=10.0, fail_send_on=None):
+    def __init__(self, *, target_is_btrfs=True, disk_percent=10.0, fail_send_on=None,
+                 list_failure=None, missing_dir=False):
+        self.missing_dir = missing_dir              # remote <base>/<kind> not created yet
+        self.list_failure = list_failure            # None | "timeout" | "ssh255"
         self.target_is_btrfs = target_is_btrfs
         self.disk_percent = disk_percent
         self.fail_send_on = fail_send_on or set()   # kinds whose send should fail
@@ -82,7 +85,13 @@ class FakeBtrfsOps:
     def ssh_capture(self, ssh_argv, remote, cmd_argv, timeout=25):
         self.ssh_calls.append(list(cmd_argv))
         out = ""
+        if cmd_argv[:2] == ["test", "-d"] and self.missing_dir:
+            return _CP(1, "", "")
         if cmd_argv[:4] == ["sudo", "btrfs", "subvolume", "list"]:
+            if self.list_failure == "timeout":
+                raise subprocess.TimeoutExpired(cmd_argv, timeout)
+            if self.list_failure == "ssh255":
+                return _CP(255, "", "ssh: connect to host 10.0.0.9: No route to host")
             kind = cmd_argv[-1].rstrip("/").split("/")[-1]
             out = "".join(f"ID 1 gen 1 top level 5 path {kind}/{n}\n"
                           for n in self.remote_subvols.get(kind, []))
@@ -342,6 +351,65 @@ class TestBackupRemote(BackupTestBase):
         r = BtrfsBackupEngine(cfg, ops=ops).run()
         self.assertEqual(r.status, "completed", r.message)
         self.assertTrue(all(p == f"{k}_20260101_000000" for k, p in ops.ssh_sent))
+
+    def test_query_timeout_does_not_fall_back_to_full(self):
+        cfg = self._remote_cfg()
+        ops = FakeBtrfsOps(target_is_btrfs=True, list_failure="timeout")
+        r = BtrfsBackupEngine(cfg, ops=ops).run()
+        self.assertEqual(r.status, "failed", r.message)
+        self.assertEqual(ops.ssh_sent, [])          # nothing sent, no blind full
+        self.assertIn("timed out", r.message)
+
+    def test_query_ssh_error_does_not_fall_back_to_full(self):
+        cfg = self._remote_cfg()
+        ops = FakeBtrfsOps(target_is_btrfs=True, list_failure="ssh255")
+        r = BtrfsBackupEngine(cfg, ops=ops).run()
+        self.assertEqual(r.status, "failed", r.message)
+        self.assertEqual(ops.ssh_sent, [])
+        self.assertIn("No route to host", r.message)
+
+    def test_answered_but_empty_remote_still_does_full(self):
+        cfg = self._remote_cfg()
+        ops = FakeBtrfsOps(target_is_btrfs=True)    # list ok, holds nothing
+        r = BtrfsBackupEngine(cfg, ops=ops).run()
+        self.assertEqual(r.status, "completed", r.message)
+        self.assertTrue(all(p is None for _, p in ops.ssh_sent))
+        self.assertEqual(len(ops.ssh_sent), 2)
+
+    def test_remote_full_kinds_reports_full_when_remote_empty(self):
+        cfg = self._remote_cfg()
+        eng = BtrfsBackupEngine(cfg, ops=FakeBtrfsOps(target_is_btrfs=True))
+        self.assertEqual(len(eng.remote_full_kinds()), len(cfg.source_mounts))
+
+    def test_remote_full_kinds_empty_when_incremental_possible(self):
+        cfg = self._remote_cfg()
+        ops = FakeBtrfsOps(target_is_btrfs=True)
+        for m in cfg.source_mounts:
+            kind = "root" if m == "/" else Path(m).name
+            (self.local_snaps / f"{kind}_20260101_000000").mkdir()
+            ops.remote_subvols[kind] = [f"{kind}_20260101_000000"]
+        self.assertEqual(BtrfsBackupEngine(cfg, ops=ops).remote_full_kinds(), [])
+
+    def test_remote_full_kinds_raises_when_remote_cannot_be_asked(self):
+        from btrfs_restore.backup import RemoteQueryError
+        cfg = self._remote_cfg()
+        eng = BtrfsBackupEngine(cfg, ops=FakeBtrfsOps(list_failure="timeout"))
+        with self.assertRaises(RemoteQueryError):
+            eng.remote_full_kinds()
+
+    def test_missing_remote_folder_counts_as_no_base_not_as_error(self):
+        cfg = self._remote_cfg()
+        eng = BtrfsBackupEngine(cfg, ops=FakeBtrfsOps(missing_dir=True))
+        self.assertEqual(len(eng.remote_full_kinds()), len(cfg.source_mounts))
+
+    def test_skip_remote_sends_nothing(self):
+        cfg = self._remote_cfg(with_usb=True)
+        ops = FakeBtrfsOps(target_is_btrfs=True)
+        eng = BtrfsBackupEngine(cfg, ops=ops)
+        eng.skip_remote = True
+        r = eng.run()
+        self.assertEqual(r.status, "completed", r.message)
+        self.assertEqual(ops.ssh_sent, [])
 
     def test_remote_send_failure_is_partial(self):
         cfg = self._remote_cfg()

@@ -44,6 +44,12 @@ logger = logging.getLogger("btrfs_restore")
 
 MANIFEST_VERSION = 1
 _SNAPSHOT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}(?:_\d)?$")
+class RemoteQueryError(RuntimeError):
+    """The remote could not be asked what it already holds (timeout, ssh or
+    sudo failure). Distinct from "asked, and it holds nothing" - the caller
+    must NOT fall back to a full send on this."""
+
+
 _COMPACT_RE = re.compile(r"^([A-Za-z0-9-]+)_\d{8}_\d{6}(?:_\d)?$")
 # per-run scratch dir name: "<pid>-<YYYYMMDD_HHMMSS>"
 _RUN_TMP_RE = re.compile(r"^(\d+)-\d{8}_\d{6}$")
@@ -87,6 +93,9 @@ class BackupResult:
 
 
 class BtrfsBackupEngine:
+    _remote_reason = ""          # why i7server failed, for the final summary
+    skip_remote = False          # set by the CLI when the user declines a full send
+
     def __init__(self, cfg: Config, ops: Optional[BtrfsOps] = None,
                  callback: Optional[EventCallback] = None,
                  state_collector_cls=None):
@@ -214,7 +223,7 @@ class BtrfsBackupEngine:
         name = datetime.now().strftime("%Y-%m-%d_%H%M%S")
         start = time.time()
         usb = self._usb_enabled() if self.cfg.target_root else False
-        remote = self._remote_enabled()
+        remote = self._remote_enabled() and not self.skip_remote
 
         if dry_run:
             return self._dry_run(name, usb, remote)
@@ -280,7 +289,9 @@ class BtrfsBackupEngine:
                 outcomes.append(("i7server", self._backup_to_remote(name, local_snaps, state_dir, result)))
 
             ok = [t for t, s in outcomes if s == "completed"]
-            bad = [f"{t}: {s}" for t, s in outcomes if s != "completed"]
+            bad = [f"{t}: {s}" + (f" ({self._remote_reason})"
+                                  if t == "i7server" and self._remote_reason else "")
+                   for t, s in outcomes if s != "completed"]
             result.duration_seconds = round(time.time() - start, 2)
             statuses = {s for _, s in outcomes}
             if statuses == {"completed"}:
@@ -434,18 +445,48 @@ class BtrfsBackupEngine:
         except CommandError as exc:
             self._emit("error", f"i7server: {exc}")
             return "partial"
+        except RemoteQueryError as exc:
+            self._remote_reason = str(exc)
+            self._emit("error", f"i7server: {exc} - not sending, a blind full "
+                                f"backup could hide a network problem")
+            return "failed"
         except (OSError, RuntimeError) as exc:
             self._emit("error", f"i7server: {exc}")
             return "failed"
 
+    def remote_full_kinds(self) -> List[str]:
+        """Kinds (root/home) that would be sent as a FULL backup to the remote
+        right now. Raises RemoteQueryError if the remote cannot be asked."""
+        ssh = build_ssh_args(self.cfg, self.cfg.user)
+        remote = f"{self.cfg.remote_user or self.cfg.user}@{self.cfg.remote_host}"
+        base = self.cfg.remote_path.rstrip("/")
+        kinds = ["root" if m == "/" else Path(m).name for m in self.cfg.source_mounts]
+        return [k for k in kinds if self._remote_parent(k, ssh, remote, base) is None]
+
     def _remote_parent(self, kind: str, ssh, remote: str, base: str) -> Optional[Path]:
         """Newest <kind>_* subvolume already on the remote that also exists in
-        /.snapshots locally - the only valid `btrfs send -p` base."""
+        /.snapshots locally - the only valid `btrfs send -p` base.
+
+        Returns None only when the remote answered and holds no usable base
+        (=> a full send is legitimate). If the remote could not be asked at
+        all, raises RemoteQueryError instead of pretending it is empty."""
         try:
-            res = self.ops.ssh_capture(
-                ssh, remote, ["sudo", "btrfs", "subvolume", "list", "-o", f"{base}/{kind}"])
-        except (OSError, subprocess.SubprocessError):
-            return None
+            exists = self.ops.ssh_capture(ssh, remote, ["test", "-d", f"{base}/{kind}"])
+            if exists.returncode == 1:
+                return None          # remote answered: folder not there yet
+            res = (exists if exists.returncode != 0 else self.ops.ssh_capture(
+                ssh, remote, ["sudo", "btrfs", "subvolume", "list", "-o", f"{base}/{kind}"]))
+        except subprocess.TimeoutExpired as exc:
+            raise RemoteQueryError(
+                f"could not list {kind} copies on the remote: timed out after "
+                f"{exc.timeout}s") from exc
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RemoteQueryError(
+                f"could not list {kind} copies on the remote: {exc}") from exc
+        if res.returncode != 0:
+            raise RemoteQueryError(
+                f"could not list {kind} copies on the remote "
+                f"(exit {res.returncode}): {(res.stderr or '').strip() or 'no error text'}")
         names = sorted(
             line.split("path", 1)[1].strip().split("/")[-1]
             for line in res.stdout.splitlines() if "path" in line
