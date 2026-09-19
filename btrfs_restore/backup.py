@@ -435,7 +435,8 @@ class BtrfsBackupEngine:
                     local, parent, ssh, remote,
                     ["sudo", "btrfs", "receive", f"{base}/{kind}/"])
                 if rc != 0:
-                    raise CommandError(rc, f"send {kind} to i7server")
+                    raise CommandError(rc, f"send {kind} to i7server",
+                                       stderr=getattr(self.ops, "last_stderr", "") or None)
                 result.parents[f"i7server/{kind}"] = parent.name if parent else None
 
             # system state -> <base>/meta/<ts>/
@@ -445,7 +446,9 @@ class BtrfsBackupEngine:
             self._write_recovery_kit_remote(ssh, remote, base)
             return "completed"
         except CommandError as exc:
-            self._emit("error", f"i7server: {exc}")
+            detail = exc.stderr.strip() if isinstance(exc.stderr, str) else ""
+            self._remote_reason = detail
+            self._emit("error", f"i7server: {exc}" + (f" - {detail}" if detail else ""))
             return "partial"
         except RemoteQueryError as exc:
             self._remote_reason = str(exc)

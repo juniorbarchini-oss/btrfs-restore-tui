@@ -16,6 +16,7 @@ from rich.theme import Theme
 
 from .backup import BtrfsBackupEngine, RemoteQueryError
 from .config import Config, BACKUP_DIRNAME
+from .notify import send_alert, clear_alert
 
 console = Console(theme=Theme({
     "info": "green", "warning": "yellow", "error": "bold red",
@@ -84,6 +85,10 @@ def _header(cfg: Config, dry_run: bool) -> Panel:
     text.append(f"Retention:   USB drive <= {cfg.max_disk_percent}%, keep >= "
                 f"{cfg.min_keep}{cap};  local/SSH keep {cfg.local_keep}", style="dim white")
     return Panel(text, border_style="green")
+
+
+def _alert_state(cfg: Config) -> Path:
+    return cfg.local_snapshots_dir / ".last-alert"
 
 
 def _confirm(question: str) -> bool:
@@ -196,6 +201,10 @@ def main() -> None:
         if not args.yes and not _confirm_remote_full(cfg):
             console.print("[dim]i7server skipped.[/dim]")
             skip_remote = True
+            if not sys.stdin.isatty():
+                send_alert("backup-now: i7server was skipped",
+                           "A full backup (or an unreachable i7server) needs confirmation. "
+                           "Run backup-now in a terminal.", cfg.user, _alert_state(cfg))
             if not cfg.target_root:
                 console.print("[dim]Nothing to do.[/dim]")
                 sys.exit(3)
@@ -244,6 +253,13 @@ def main() -> None:
             border_style="yellow"))
         sys.exit(130)
 
+    if not args.dry_run:
+        if result.status == "completed":
+            clear_alert(_alert_state(cfg))
+        else:
+            send_alert(f"backup-now: backup {result.status.upper()}",
+                       result.message or "See the backup-now output / last log.",
+                       cfg.user, _alert_state(cfg))
     _print_summary(result, args.dry_run)
     sys.exit(0 if result.ok else 1)
 
