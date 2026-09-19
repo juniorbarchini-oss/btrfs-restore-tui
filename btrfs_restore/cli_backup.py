@@ -14,8 +14,9 @@ from rich.panel import Panel
 from rich.text import Text
 from rich.theme import Theme
 
-from .backup import BtrfsBackupEngine
+from .backup import BtrfsBackupEngine, RemoteQueryError
 from .config import Config, BACKUP_DIRNAME
+from .notify import send_alert, clear_alert
 
 console = Console(theme=Theme({
     "info": "green", "warning": "yellow", "error": "bold red",
@@ -86,6 +87,71 @@ def _header(cfg: Config, dry_run: bool) -> Panel:
     return Panel(text, border_style="green")
 
 
+def _alert_state(cfg: Config) -> Path:
+    return cfg.local_snapshots_dir / ".last-alert"
+
+
+def _confirm(question: str) -> bool:
+    try:
+        return input(f"{question} [y/N] ").strip().lower() in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        return False
+
+
+def _confirm_remote_full(cfg: Config) -> bool:
+    """Ask before a full send to the remote. True = go ahead (or nothing to
+    ask), False = the user declined. A remote that cannot be asked is never
+    read as 'holds nothing'."""
+    engine = BtrfsBackupEngine(cfg)
+    where = f"{cfg.remote_host}:{cfg.remote_path}"
+    try:
+        full = engine.remote_full_kinds()
+    except RemoteQueryError as exc:
+        console.print(Panel(
+            "[bold yellow]i7server: could not check for previous snapshots[/bold yellow]"
+            f" - {exc}\n"
+            f"Destination: [bold]{where}[/bold]\n\n"
+            "Continuing would send a FULL backup. If you expected a fast "
+            "incremental, stop and check the network / host.",
+            border_style="yellow", title="[yellow]Confirm[/yellow]"))
+    else:
+        if not full:
+            return True
+        console.print(Panel(
+            f"[bold yellow]i7server: this would be a FULL backup[/bold yellow] "
+            f"({', '.join(full)}) - no previous snapshot found there.\n"
+            f"Destination: [bold]{where}[/bold]\n\n"
+            "Normal for the first backup to a target. If you expected a fast "
+            "incremental, stop and check the drive / host.",
+            border_style="yellow", title="[yellow]Confirm[/yellow]"))
+    return _confirm("Continue with a full backup to i7server?")
+
+
+def _confirm_remote_heal(cfg: Config) -> list:
+    """Offer to delete half-received copies on the remote. Returns the approved
+    [(kind, name)]; nothing is deleted without an explicit y (no terminal = no)."""
+    try:
+        partial = BtrfsBackupEngine(cfg).remote_partial_copies()
+    except RemoteQueryError:
+        return []                       # the full-backup check already reported it
+    if not partial:
+        return []
+    deletable = [p for p in partial if not p["has_children"]]
+    lines = [f"  {p['kind']}/{p['name']}" + ("  (kept: other snapshots depend on it)"
+                                             if p["has_children"] else "")
+             for p in partial]
+    console.print(Panel(
+        f"[bold yellow]i7server: {len(partial)} partial (half-received) "
+        "copy(ies) found[/bold yellow]\n" + "\n".join(lines) + "\n\n"
+        "Left over by an interrupted receive. They are never used as a base, but "
+        "they take space and hide problems.",
+        border_style="yellow", title="[yellow]Confirm[/yellow]"))
+    if deletable and _confirm(f"Delete {len(deletable)} partial copy(ies) on i7server?"):
+        return [(p["kind"], p["name"]) for p in deletable]
+    console.print("[dim]Partial copies left in place.[/dim]")
+    return []
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="backup-now",
@@ -101,6 +167,8 @@ def main() -> None:
                         help="never prune below this many snapshots (default 2)")
     parser.add_argument("--target", metavar="DIR",
                         help="override backup target mount point")
+    parser.add_argument("--yes", "-y", action="store_true",
+                        help="skip the confirmation prompt shown before a full backup")
     parser.add_argument("--quiet", action="store_true",
                         help="plain line output instead of the live dashboard")
     args = parser.parse_args()
@@ -126,6 +194,23 @@ def main() -> None:
             border_style="red"))
         sys.exit(2)
 
+    skip_remote = False
+    heal_approved: list = []
+    if (not args.dry_run and cfg.remote_host and cfg.remote_path
+            and BtrfsBackupEngine(cfg)._remote_enabled()):
+        if not args.yes and not _confirm_remote_full(cfg):
+            console.print("[dim]i7server skipped.[/dim]")
+            skip_remote = True
+            if not sys.stdin.isatty():
+                send_alert("backup-now: i7server was skipped",
+                           "A full backup (or an unreachable i7server) needs confirmation. "
+                           "Run backup-now in a terminal.", cfg.user, _alert_state(cfg))
+            if not cfg.target_root:
+                console.print("[dim]Nothing to do.[/dim]")
+                sys.exit(3)
+        if not skip_remote:
+            heal_approved = _confirm_remote_heal(cfg)   # --yes never approves deletions
+
     try:
         if args.quiet or args.dry_run:
             def quiet_cb(t, m):
@@ -134,10 +219,14 @@ def main() -> None:
                 else:
                     console.print(f"[{t}] {m}", style=t)
             engine = BtrfsBackupEngine(cfg, callback=quiet_cb)
+            engine.skip_remote = skip_remote
+            engine.heal_approved = heal_approved
             result = engine.run(dry_run=args.dry_run)
         else:
             dash = Dashboard("Synchronizing snapshots")
             engine = BtrfsBackupEngine(cfg, callback=dash.on_event)
+            engine.skip_remote = skip_remote
+            engine.heal_approved = heal_approved
             stop = threading.Event()
             from rich.live import Live
 
@@ -164,6 +253,13 @@ def main() -> None:
             border_style="yellow"))
         sys.exit(130)
 
+    if not args.dry_run:
+        if result.status == "completed":
+            clear_alert(_alert_state(cfg))
+        else:
+            send_alert(f"backup-now: backup {result.status.upper()}",
+                       result.message or "See the backup-now output / last log.",
+                       cfg.user, _alert_state(cfg))
     _print_summary(result, args.dry_run)
     sys.exit(0 if result.ok else 1)
 

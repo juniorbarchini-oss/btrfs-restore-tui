@@ -75,7 +75,16 @@ never below `MIN_KEEP` (2), never the last. `MAX_SNAPSHOTS` is an optional hard
 cap. Local RO snapshots are kept `LOCAL_KEEP` deep (10) as `send -p` parents.
 
 Flags: `--dry-run`, `--target DIR`, `--keep N`, `--min-keep N`,
-`--max-disk-percent PCT`, `--quiet`.
+`--max-disk-percent PCT`, `--quiet`, `--yes`.
+
+**Full-backup confirmation (SSH host).** Before starting, `backup-now` asks the
+remote what it already holds. If the send would be a full one, it shows a
+confirmation panel and asks `Continue with a full backup? [y/N]` (default no; with
+no terminal it counts as "no", so the SSH target is skipped). If the remote cannot
+be queried at all (timeout, ssh failure), the panel says so and shows the real
+reason: a failed query is never read as "the remote holds nothing". `--yes` skips
+the prompt, but an unreachable remote still fails that target instead of sending a
+blind full backup. Same behavior as the ext4 edition (`restore-tui`).
 
 ---
 

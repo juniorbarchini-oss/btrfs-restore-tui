@@ -44,6 +44,12 @@ logger = logging.getLogger("btrfs_restore")
 
 MANIFEST_VERSION = 1
 _SNAPSHOT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}(?:_\d)?$")
+class RemoteQueryError(RuntimeError):
+    """The remote could not be asked what it already holds (timeout, ssh or
+    sudo failure). Distinct from "asked, and it holds nothing" - the caller
+    must NOT fall back to a full send on this."""
+
+
 _COMPACT_RE = re.compile(r"^([A-Za-z0-9-]+)_\d{8}_\d{6}(?:_\d)?$")
 # per-run scratch dir name: "<pid>-<YYYYMMDD_HHMMSS>"
 _RUN_TMP_RE = re.compile(r"^(\d+)-\d{8}_\d{6}$")
@@ -87,6 +93,10 @@ class BackupResult:
 
 
 class BtrfsBackupEngine:
+    heal_approved: List[tuple] = []   # (kind, name) partial remote copies the user OK'd to delete
+    _remote_reason = ""          # why i7server failed, for the final summary
+    skip_remote = False          # set by the CLI when the user declines a full send
+
     def __init__(self, cfg: Config, ops: Optional[BtrfsOps] = None,
                  callback: Optional[EventCallback] = None,
                  state_collector_cls=None):
@@ -214,7 +224,7 @@ class BtrfsBackupEngine:
         name = datetime.now().strftime("%Y-%m-%d_%H%M%S")
         start = time.time()
         usb = self._usb_enabled() if self.cfg.target_root else False
-        remote = self._remote_enabled()
+        remote = self._remote_enabled() and not self.skip_remote
 
         if dry_run:
             return self._dry_run(name, usb, remote)
@@ -280,7 +290,9 @@ class BtrfsBackupEngine:
                 outcomes.append(("i7server", self._backup_to_remote(name, local_snaps, state_dir, result)))
 
             ok = [t for t, s in outcomes if s == "completed"]
-            bad = [f"{t}: {s}" for t, s in outcomes if s != "completed"]
+            bad = [f"{t}: {s}" + (f" ({self._remote_reason})"
+                                  if t == "i7server" and self._remote_reason else "")
+                   for t, s in outcomes if s != "completed"]
             result.duration_seconds = round(time.time() - start, 2)
             statuses = {s for _, s in outcomes}
             if statuses == {"completed"}:
@@ -412,6 +424,7 @@ class BtrfsBackupEngine:
                 self._emit("error", f"i7server: {mk.stderr.strip() or 'ssh failed'}")
                 return "unreachable"
 
+            self._heal_remote(ssh, remote, base, local_snaps)
             for kind, local_name in local_snaps.items():
                 local = self.cfg.local_snapshots_dir / local_name
                 parent = self._remote_parent(kind, ssh, remote, base)
@@ -422,7 +435,8 @@ class BtrfsBackupEngine:
                     local, parent, ssh, remote,
                     ["sudo", "btrfs", "receive", f"{base}/{kind}/"])
                 if rc != 0:
-                    raise CommandError(rc, f"send {kind} to i7server")
+                    raise CommandError(rc, f"send {kind} to i7server",
+                                       stderr=getattr(self.ops, "last_stderr", "") or None)
                 result.parents[f"i7server/{kind}"] = parent.name if parent else None
 
             # system state -> <base>/meta/<ts>/
@@ -432,23 +446,166 @@ class BtrfsBackupEngine:
             self._write_recovery_kit_remote(ssh, remote, base)
             return "completed"
         except CommandError as exc:
-            self._emit("error", f"i7server: {exc}")
+            detail = exc.stderr.strip() if isinstance(exc.stderr, str) else ""
+            self._remote_reason = detail
+            self._emit("error", f"i7server: {exc}" + (f" - {detail}" if detail else ""))
             return "partial"
+        except RemoteQueryError as exc:
+            self._remote_reason = str(exc)
+            self._emit("error", f"i7server: {exc} - not sending, a blind full "
+                                f"backup could hide a network problem")
+            return "failed"
         except (OSError, RuntimeError) as exc:
             self._emit("error", f"i7server: {exc}")
             return "failed"
 
-    def _remote_parent(self, kind: str, ssh, remote: str, base: str) -> Optional[Path]:
-        """Newest <kind>_* subvolume already on the remote that also exists in
-        /.snapshots locally - the only valid `btrfs send -p` base."""
+    @staticmethod
+    def _has_received_uuid(line: str) -> bool:
+        parts = line.split()
         try:
-            res = self.ops.ssh_capture(
-                ssh, remote, ["sudo", "btrfs", "subvolume", "list", "-o", f"{base}/{kind}"])
-        except (OSError, subprocess.SubprocessError):
-            return None
+            return parts[parts.index("received_uuid") + 1] != "-"
+        except (ValueError, IndexError):
+            return False
+
+    @staticmethod
+    def _parse_subvol(line: str) -> dict:
+        """`btrfs subvolume list -u -q -R` line -> {uuid, parent_uuid, received_uuid, path}."""
+        out = {}
+        parts = line.split()
+        for key in ("uuid", "parent_uuid", "received_uuid"):
+            if key in parts and parts.index(key) + 1 < len(parts):
+                out[key] = parts[parts.index(key) + 1]
+        if "path" in line:
+            out["path"] = line.split("path", 1)[1].strip()
+        return out
+
+    def _ssh_or_raise(self, ssh, remote: str, argv: List[str], what: str):
+        try:
+            res = self.ops.ssh_capture(ssh, remote, argv)
+        except subprocess.TimeoutExpired as exc:
+            raise RemoteQueryError(f"{what}: timed out after {exc.timeout}s") from exc
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RemoteQueryError(f"{what}: {exc}") from exc
+        return res
+
+    def remote_partial_copies(self) -> List[dict]:
+        """Half-received copies under <base>/root and <base>/home: read-write with
+        received_uuid '-' (a finished receive is read-only and has one). Each item
+        is {kind, name, has_children}. Raises RemoteQueryError if the remote
+        cannot be asked. Read-only: deletes nothing."""
+        ssh = build_ssh_args(self.cfg, self.cfg.user)
+        remote = f"{self.cfg.remote_user or self.cfg.user}@{self.cfg.remote_host}"
+        base = self.cfg.remote_path.rstrip("/")
+        kinds = ["root" if m == "/" else Path(m).name for m in self.cfg.source_mounts]
+        found, all_subvols = [], []
+        for kind in kinds:
+            path = f"{base}/{kind}"
+            exists = self._ssh_or_raise(ssh, remote, ["test", "-d", path],
+                                        f"could not check {kind} copies on the remote")
+            if exists.returncode == 1:
+                continue
+            allq = self._ssh_or_raise(
+                ssh, remote, ["sudo", "btrfs", "subvolume", "list", "-o", "-u", "-q", "-R", path],
+                f"could not list {kind} copies on the remote")
+            roq = self._ssh_or_raise(
+                ssh, remote, ["sudo", "btrfs", "subvolume", "list", "-o", "-r", path],
+                f"could not list {kind} copies on the remote")
+            for res in (allq, roq):
+                if res.returncode != 0:
+                    raise RemoteQueryError(
+                        f"could not list {kind} copies on the remote (exit {res.returncode}): "
+                        f"{(res.stderr or '').strip() or 'no error text'}")
+            ro_paths = {self._parse_subvol(ln).get("path") for ln in roq.stdout.splitlines()
+                        if "path" in ln}
+            subs = [self._parse_subvol(ln) for ln in allq.stdout.splitlines() if "path" in ln]
+            all_subvols += subs
+            for sv in subs:
+                name = sv["path"].split("/")[-1]
+                if (_COMPACT_RE.match(name) and name.startswith(f"{kind}_")
+                        and sv["path"] not in ro_paths and sv.get("received_uuid") == "-"
+                        and sv.get("uuid")):
+                    found.append({"kind": kind, "name": name, "uuid": sv["uuid"]})
+        for item in found:
+            item["has_children"] = any(sv.get("parent_uuid") == item["uuid"] for sv in all_subvols)
+            del item["uuid"]
+        return found
+
+    def _heal_remote(self, ssh, remote: str, base: str, local_snaps: Dict[str, str]) -> None:
+        """Delete the partial remote copies the user approved, re-checking every
+        safeguard right before deleting. Anything that does not add up is kept."""
+        if not self.heal_approved:
+            return
+        try:
+            alive = self._ssh_or_raise(ssh, remote, ["pgrep", "-f", "'[b]trfs receive'"],
+                                       "could not check for a running btrfs receive")
+            if alive.returncode != 1:
+                self._emit("warning", "i7server: a btrfs receive is running (or could not be "
+                                      "checked) - not deleting partial copies")
+                return
+            current = {(c["kind"], c["name"]): c for c in self.remote_partial_copies()}
+        except RemoteQueryError as exc:
+            self._emit("warning", f"i7server: partial copies not deleted - {exc}")
+            return
+        for kind, name in self.heal_approved:
+            item = current.get((kind, name))
+            if item is None:
+                self._emit("info", f"i7server: {name} is no longer a partial copy - kept")
+            elif item["has_children"]:
+                self._emit("warning", f"i7server: {name} has snapshots depending on it - kept")
+            elif name == local_snaps.get(kind):
+                self._emit("warning", f"i7server: {name} is the copy being sent - kept")
+            else:
+                d = self.ops.ssh_capture(
+                    ssh, remote, ["sudo", "btrfs", "subvolume", "delete", f"{base}/{kind}/{name}"])
+                if d.returncode == 0:
+                    self._emit("warning", f"i7server: deleted partial copy {kind}/{name} "
+                                          f"(read-write, no received_uuid: an interrupted receive)")
+                else:
+                    self._emit("warning", f"i7server: could not delete {name}: "
+                                          f"{(d.stderr or '').strip() or d.returncode}")
+
+    def remote_full_kinds(self) -> List[str]:
+        """Kinds (root/home) that would be sent as a FULL backup to the remote
+        right now. Raises RemoteQueryError if the remote cannot be asked."""
+        ssh = build_ssh_args(self.cfg, self.cfg.user)
+        remote = f"{self.cfg.remote_user or self.cfg.user}@{self.cfg.remote_host}"
+        base = self.cfg.remote_path.rstrip("/")
+        kinds = ["root" if m == "/" else Path(m).name for m in self.cfg.source_mounts]
+        return [k for k in kinds if self._remote_parent(k, ssh, remote, base) is None]
+
+    def _remote_parent(self, kind: str, ssh, remote: str, base: str) -> Optional[Path]:
+        """Newest COMPLETE <kind>_* subvolume already on the remote (read-only,
+        with a received_uuid) that also exists in /.snapshots locally - the only
+        valid `btrfs send -p` base.
+
+        Returns None only when the remote answered and holds no usable base
+        (=> a full send is legitimate). If the remote could not be asked at
+        all, raises RemoteQueryError instead of pretending it is empty."""
+        try:
+            exists = self.ops.ssh_capture(ssh, remote, ["test", "-d", f"{base}/{kind}"])
+            if exists.returncode == 1:
+                return None          # remote answered: folder not there yet
+            res = (exists if exists.returncode != 0 else self.ops.ssh_capture(
+                ssh, remote,
+                ["sudo", "btrfs", "subvolume", "list", "-o", "-r", "-R", f"{base}/{kind}"]))
+        except subprocess.TimeoutExpired as exc:
+            raise RemoteQueryError(
+                f"could not list {kind} copies on the remote: timed out after "
+                f"{exc.timeout}s") from exc
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RemoteQueryError(
+                f"could not list {kind} copies on the remote: {exc}") from exc
+        if res.returncode != 0:
+            raise RemoteQueryError(
+                f"could not list {kind} copies on the remote "
+                f"(exit {res.returncode}): {(res.stderr or '').strip() or 'no error text'}")
+        # -r lists only read-only subvolumes and -R adds the received_uuid: a
+        # half-received copy is read-write and has received_uuid "-", so it can
+        # never be picked as a base (a receive that died midway used to be).
         names = sorted(
             line.split("path", 1)[1].strip().split("/")[-1]
-            for line in res.stdout.splitlines() if "path" in line
+            for line in res.stdout.splitlines()
+            if "path" in line and self._has_received_uuid(line)
         )
         names = [n for n in names if _COMPACT_RE.match(n) and n.startswith(f"{kind}_")]
         for n in reversed(names):
@@ -477,7 +634,10 @@ class BtrfsBackupEngine:
                 names = sorted(
                     ln.split("path", 1)[1].strip().split("/")[-1]
                     for ln in res.stdout.splitlines() if "path" in ln)
-                names = [n for n in names if n.startswith(f"{kind}_")]
+                # timestamped copies only: a hand-made name must never count as
+                # "newest" nor be deleted by the retention pass
+                names = [n for n in names
+                         if _COMPACT_RE.match(n) and n.startswith(f"{kind}_")]
                 for old in names[:-keep]:
                     d = self.ops.ssh_capture(
                         ssh, remote,

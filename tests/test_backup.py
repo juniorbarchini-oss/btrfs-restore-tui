@@ -21,7 +21,10 @@ from btrfs_restore.btrfs_ops import CommandError, prune_paths
 
 
 class FakeBtrfsOps:
-    def __init__(self, *, target_is_btrfs=True, disk_percent=10.0, fail_send_on=None):
+    def __init__(self, *, target_is_btrfs=True, disk_percent=10.0, fail_send_on=None,
+                 list_failure=None, missing_dir=False):
+        self.missing_dir = missing_dir              # remote <base>/<kind> not created yet
+        self.list_failure = list_failure            # None | "timeout" | "ssh255"
         self.target_is_btrfs = target_is_btrfs
         self.disk_percent = disk_percent
         self.fail_send_on = fail_send_on or set()   # kinds whose send should fail
@@ -29,6 +32,10 @@ class FakeBtrfsOps:
         self.sent = []
         self.ssh_sent = []                          # (kind, parent_name) to remote
         self.remote_subvols = {"root": [], "home": []}
+        self.remote_partial = {}                    # kind -> half-received (rw) names
+        self.remote_children = set()                # partial names that have a dependent snapshot
+        self.receive_alive = False                  # a btrfs receive is running remotely
+        self.ssh_deleted = []
         self.ssh_calls = []
         self.pushed_trees = []                       # [(remote_dir, {relpath: bytes})]
 
@@ -82,10 +89,31 @@ class FakeBtrfsOps:
     def ssh_capture(self, ssh_argv, remote, cmd_argv, timeout=25):
         self.ssh_calls.append(list(cmd_argv))
         out = ""
+        if cmd_argv[0] == "pgrep":
+            return _CP(0 if self.receive_alive else 1, "", "")
+        if cmd_argv[:4] == ["sudo", "btrfs", "subvolume", "delete"]:
+            self.ssh_deleted.append(cmd_argv[-1])
+            return _CP(0, "", "")
+        if cmd_argv[:2] == ["test", "-d"] and self.missing_dir:
+            return _CP(1, "", "")
         if cmd_argv[:4] == ["sudo", "btrfs", "subvolume", "list"]:
+            if self.list_failure == "timeout":
+                raise subprocess.TimeoutExpired(cmd_argv, timeout)
+            if self.list_failure == "ssh255":
+                return _CP(255, "", "ssh: connect to host 10.0.0.9: No route to host")
             kind = cmd_argv[-1].rstrip("/").split("/")[-1]
-            out = "".join(f"ID 1 gen 1 top level 5 path {kind}/{n}\n"
+            out = "".join(f"ID 1 gen 1 top level 5 parent_uuid - received_uuid u-{n} "
+                          f"uuid id-{n} path {kind}/{n}\n"
                           for n in self.remote_subvols.get(kind, []))
+            if "-r" not in cmd_argv:       # -r = read-only only: partials show up otherwise
+                for n in self.remote_partial.get(kind, []):
+                    out += (f"ID 2 gen 2 top level 5 parent_uuid - received_uuid - "
+                            f"uuid id-{n} path {kind}/{n}\n")
+        if cmd_argv[:4] == ["sudo", "btrfs", "subvolume", "list"]:
+            for n in self.remote_partial.get(kind, []):
+                if n in self.remote_children:      # a complete snapshot depending on it
+                    out += (f"ID 3 gen 3 top level 5 parent_uuid id-{n} received_uuid u-kid "
+                            f"uuid id-kid path {kind}/{kind}_20991231_000000\n")
         return _CP(0, out, "")
 
     def send_ssh_receive(self, source, parent, ssh_argv, remote, receive_argv):
@@ -342,6 +370,199 @@ class TestBackupRemote(BackupTestBase):
         r = BtrfsBackupEngine(cfg, ops=ops).run()
         self.assertEqual(r.status, "completed", r.message)
         self.assertTrue(all(p == f"{k}_20260101_000000" for k, p in ops.ssh_sent))
+
+    def test_query_timeout_does_not_fall_back_to_full(self):
+        cfg = self._remote_cfg()
+        ops = FakeBtrfsOps(target_is_btrfs=True, list_failure="timeout")
+        r = BtrfsBackupEngine(cfg, ops=ops).run()
+        self.assertEqual(r.status, "failed", r.message)
+        self.assertEqual(ops.ssh_sent, [])          # nothing sent, no blind full
+        self.assertIn("timed out", r.message)
+
+    def test_query_ssh_error_does_not_fall_back_to_full(self):
+        cfg = self._remote_cfg()
+        ops = FakeBtrfsOps(target_is_btrfs=True, list_failure="ssh255")
+        r = BtrfsBackupEngine(cfg, ops=ops).run()
+        self.assertEqual(r.status, "failed", r.message)
+        self.assertEqual(ops.ssh_sent, [])
+        self.assertIn("No route to host", r.message)
+
+    def test_answered_but_empty_remote_still_does_full(self):
+        cfg = self._remote_cfg()
+        ops = FakeBtrfsOps(target_is_btrfs=True)    # list ok, holds nothing
+        r = BtrfsBackupEngine(cfg, ops=ops).run()
+        self.assertEqual(r.status, "completed", r.message)
+        self.assertTrue(all(p is None for _, p in ops.ssh_sent))
+        self.assertEqual(len(ops.ssh_sent), 2)
+
+    def test_remote_full_kinds_reports_full_when_remote_empty(self):
+        cfg = self._remote_cfg()
+        eng = BtrfsBackupEngine(cfg, ops=FakeBtrfsOps(target_is_btrfs=True))
+        self.assertEqual(len(eng.remote_full_kinds()), len(cfg.source_mounts))
+
+    def test_remote_full_kinds_empty_when_incremental_possible(self):
+        cfg = self._remote_cfg()
+        ops = FakeBtrfsOps(target_is_btrfs=True)
+        for m in cfg.source_mounts:
+            kind = "root" if m == "/" else Path(m).name
+            (self.local_snaps / f"{kind}_20260101_000000").mkdir()
+            ops.remote_subvols[kind] = [f"{kind}_20260101_000000"]
+        self.assertEqual(BtrfsBackupEngine(cfg, ops=ops).remote_full_kinds(), [])
+
+    def test_remote_full_kinds_raises_when_remote_cannot_be_asked(self):
+        from btrfs_restore.backup import RemoteQueryError
+        cfg = self._remote_cfg()
+        eng = BtrfsBackupEngine(cfg, ops=FakeBtrfsOps(list_failure="timeout"))
+        with self.assertRaises(RemoteQueryError):
+            eng.remote_full_kinds()
+
+    def test_missing_remote_folder_counts_as_no_base_not_as_error(self):
+        cfg = self._remote_cfg()
+        eng = BtrfsBackupEngine(cfg, ops=FakeBtrfsOps(missing_dir=True))
+        self.assertEqual(len(eng.remote_full_kinds()), len(cfg.source_mounts))
+
+    def test_skip_remote_sends_nothing(self):
+        cfg = self._remote_cfg(with_usb=True)
+        ops = FakeBtrfsOps(target_is_btrfs=True)
+        eng = BtrfsBackupEngine(cfg, ops=ops)
+        eng.skip_remote = True
+        r = eng.run()
+        self.assertEqual(r.status, "completed", r.message)
+        self.assertEqual(ops.ssh_sent, [])
+
+    def _local_and_remote(self, ops, kind, name, partial=False):
+        (self.local_snaps / name).mkdir(exist_ok=True)
+        target = ops.remote_partial if partial else ops.remote_subvols
+        target.setdefault(kind, []).append(name)
+
+    def test_half_received_remote_snapshot_is_never_the_base(self):
+        cfg = self._remote_cfg()
+        ops = FakeBtrfsOps(target_is_btrfs=True)
+        for kind in ("rootfs", "homefs"):
+            self._local_and_remote(ops, kind, f"{kind}_20260101_000000")
+            self._local_and_remote(ops, kind, f"{kind}_20260102_000000", partial=True)
+        r = BtrfsBackupEngine(cfg, ops=ops).run()
+        self.assertEqual(r.status, "completed", r.message)
+        # falls back to the older COMPLETE copy, not the newer broken one
+        self.assertTrue(all(p == f"{k}_20260101_000000" for k, p in ops.ssh_sent))
+
+    def test_only_half_received_copies_means_full(self):
+        cfg = self._remote_cfg()
+        ops = FakeBtrfsOps(target_is_btrfs=True)
+        for kind in ("rootfs", "homefs"):
+            self._local_and_remote(ops, kind, f"{kind}_20260102_000000", partial=True)
+        eng = BtrfsBackupEngine(cfg, ops=ops)
+        self.assertEqual(len(eng.remote_full_kinds()), len(cfg.source_mounts))
+
+    def test_received_uuid_dash_line_is_not_a_valid_base(self):
+        self.assertFalse(BtrfsBackupEngine._has_received_uuid(
+            "ID 5 gen 1 top level 5 received_uuid - path home/home_20260101_000000"))
+        self.assertTrue(BtrfsBackupEngine._has_received_uuid(
+            "ID 5 gen 1 top level 5 received_uuid abc-1 path home/home_20260101_000000"))
+        self.assertFalse(BtrfsBackupEngine._has_received_uuid("ID 5 path home/x"))
+
+    # -- self-heal of half-received copies (issue #24) --------------------
+    def _heal_setup(self, partial_names=None, **fake_kw):
+        cfg = self._remote_cfg()
+        ops = FakeBtrfsOps(target_is_btrfs=True)
+        for key, val in fake_kw.items():
+            setattr(ops, key, val)
+        self.kinds = ["root" if m == "/" else Path(m).name for m in cfg.source_mounts]
+        for k in self.kinds:
+            for n in (partial_names or [f"{k}_20260102_000000"]):
+                ops.remote_partial.setdefault(k, []).append(n)
+        return cfg, ops
+
+    def _run_heal(self, cfg, ops, approved):
+        events = []
+        eng = BtrfsBackupEngine(cfg, ops=ops, callback=lambda t, m: events.append((t, m)))
+        eng.heal_approved = approved
+        r = eng.run()
+        return r, events
+
+    def test_partial_copies_are_listed_without_deleting(self):
+        cfg, ops = self._heal_setup()
+        found = BtrfsBackupEngine(cfg, ops=ops).remote_partial_copies()
+        self.assertEqual({(f["kind"], f["name"]) for f in found},
+                         {(k, f"{k}_20260102_000000") for k in self.kinds})
+        self.assertTrue(all(not f["has_children"] for f in found))
+        self.assertEqual(ops.ssh_deleted, [])
+
+    def test_name_outside_the_timestamp_pattern_is_never_listed(self):
+        cfg, ops = self._heal_setup(partial_names=["manual_thing", "x_20260102_000000"])
+        self.assertEqual(BtrfsBackupEngine(cfg, ops=ops).remote_partial_copies(), [])
+
+    def test_approved_partial_copy_is_deleted_and_logged(self):
+        cfg, ops = self._heal_setup()
+        approved = [(k, f"{k}_20260102_000000") for k in self.kinds]
+        r, events = self._run_heal(cfg, ops, approved)
+        self.assertEqual(r.status, "completed", r.message)
+        self.assertEqual(sorted(ops.ssh_deleted), sorted(
+            f"/srv/backups/{k}/{k}_20260102_000000" for k in self.kinds))
+        self.assertTrue(any("deleted partial copy" in m for _, m in events))
+
+    def test_nothing_deleted_without_approval(self):
+        cfg, ops = self._heal_setup()
+        self._run_heal(cfg, ops, [])
+        self.assertEqual(ops.ssh_deleted, [])
+
+    def test_nothing_deleted_while_a_receive_is_running(self):
+        cfg, ops = self._heal_setup(receive_alive=True)
+        approved = [(k, f"{k}_20260102_000000") for k in self.kinds]
+        _, events = self._run_heal(cfg, ops, approved)
+        self.assertEqual(ops.ssh_deleted, [])
+        self.assertTrue(any("receive is running" in m for _, m in events))
+
+    def test_copy_with_dependents_is_kept(self):
+        cfg, ops = self._heal_setup()
+        for k in self.kinds:
+            ops.remote_children.add(f"{k}_20260102_000000")
+        found = BtrfsBackupEngine(cfg, ops=ops).remote_partial_copies()
+        self.assertTrue(all(f["has_children"] for f in found))
+        approved = [(k, f"{k}_20260102_000000") for k in self.kinds]
+        _, events = self._run_heal(cfg, ops, approved)
+        self.assertEqual(ops.ssh_deleted, [])
+        self.assertTrue(any("depending on it" in m for _, m in events))
+
+    def test_approved_name_that_is_not_partial_is_not_deleted(self):
+        cfg, ops = self._heal_setup()
+        good = {}
+        for k in self.kinds:
+            self._local_and_remote(ops, k, f"{k}_20260101_000000")
+            good[k] = f"{k}_20260101_000000"
+        _, events = self._run_heal(cfg, ops, list(good.items()))
+        self.assertFalse([d for d in ops.ssh_deleted if "20260101" in d])
+
+    def test_query_failure_while_healing_deletes_nothing(self):
+        cfg, ops = self._heal_setup(list_failure="ssh255")
+        approved = [(k, f"{k}_20260102_000000") for k in self.kinds]
+        self._run_heal(cfg, ops, approved)
+        self.assertEqual(ops.ssh_deleted, [])
+
+    def test_receiver_error_reaches_the_log_and_the_summary(self):
+        cfg = self._remote_cfg()
+        ops = FakeBtrfsOps(target_is_btrfs=True, fail_send_on={"homefs"})
+        ops.last_stderr = "ssh[1]: ERROR: cannot receive: parent subvol is not read-only"
+        events = []
+        r = BtrfsBackupEngine(cfg, ops=ops, callback=lambda t, m: events.append((t, m))).run()
+        self.assertEqual(r.status, "partial", r.message)
+        self.assertIn("parent subvol is not read-only", r.message)
+        self.assertTrue(any("parent subvol is not read-only" in m for t, m in events
+                            if t == "error"))
+
+    def test_remote_prune_ignores_names_outside_the_timestamp_pattern(self):
+        cfg = self._remote_cfg()
+        cfg.local_keep = 2
+        ops = FakeBtrfsOps(target_is_btrfs=True)
+        for k in ("root", "home"):      # _prune_remote walks the real kinds
+            ops.remote_subvols[k] = [f"{k}_2026010{i}_000000" for i in range(1, 5)] + [f"{k}_manual"]
+        r = BtrfsBackupEngine(cfg, ops=ops).run()
+        self.assertEqual(r.status, "completed", r.message)
+        self.assertFalse([d for d in ops.ssh_deleted if d.endswith("_manual")])
+        self.assertTrue([d for d in ops.ssh_deleted if "_20260101_" in d])   # old ones still go
+        # the manual name must not push a real copy out of the keep window:
+        # the two newest TIMESTAMPED copies (03 and 04) stay
+        self.assertFalse([d for d in ops.ssh_deleted if "_20260103_" in d or "_20260104_" in d])
 
     def test_remote_send_failure_is_partial(self):
         cfg = self._remote_cfg()
